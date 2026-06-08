@@ -70,6 +70,10 @@ created_at TIMESTAMPTZ
 updated_at TIMESTAMPTZ
 ```
 
+The seed script does not create this table. It verifies the table exists and
+then inserts or updates the example prompt row. Create the table with a
+database owner or migration account before running the seed script.
+
 Prompt metadata such as `model_size` is stored as JSON in `comments`:
 
 ```json

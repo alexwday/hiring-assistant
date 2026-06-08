@@ -143,29 +143,23 @@ def validate_prompt_row(
 
 
 def ensure_prompts_table(config: AppConfig | None = None) -> None:
-    """Create the prompts table when it is not already present."""
+    """Verify the prompts table exists without issuing schema DDL."""
+    config = config or load_config()
+    table_ref = f"{config.database.schema}.{PROMPTS_TABLE}"
     with connection_scope(config) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                CREATE TABLE IF NOT EXISTS prompts (
-                    id SERIAL PRIMARY KEY,
-                    model TEXT NOT NULL,
-                    layer TEXT,
-                    name TEXT NOT NULL,
-                    description TEXT,
-                    comments TEXT,
-                    system_prompt TEXT,
-                    user_prompt TEXT,
-                    tool_definition JSONB,
-                    uses_global TEXT[],
-                    version TEXT DEFAULT '1.0.0',
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                )
-                """
+                SELECT to_regclass(%s)
+                """,
+                (table_ref,),
             )
-        conn.commit()
+            exists = cursor.fetchone()[0] is not None
+    if not exists:
+        raise FileNotFoundError(
+            f"PostgreSQL prompts table not found: {table_ref}. "
+            "Create it with an owner/migration account before running the seed script."
+        )
 
 
 def upsert_prompt(
