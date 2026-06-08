@@ -1,0 +1,4 @@
+httpx>=0.28
+openai>=1.105
+psycopg2-binary>=2.9
+requests>=2.32
