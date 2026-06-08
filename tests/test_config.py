@@ -1,14 +1,22 @@
+"""Tests for dotenv parsing and typed config loading."""
+
 from pathlib import Path
 
 from utilities.config import load_config, read_env_file
 
 
 def test_read_env_file_preserves_quoted_hash(tmp_path: Path):
+    """It preserves quoted hashes and strips unquoted inline comments."""
     env_file = tmp_path / ".env"
     env_file.write_text(
-        "OPENAI_API_KEY='abc#123'\n"
-        "LOG_LEVEL=DEBUG # comment\n"
-        "EMPTY=\n",
+        "\n".join(
+            [
+                "OPENAI_API_KEY='abc#123'",
+                "LOG_LEVEL=DEBUG # comment",
+                "EMPTY=",
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -20,6 +28,7 @@ def test_read_env_file_preserves_quoted_hash(tmp_path: Path):
 
 
 def test_load_config_supports_aegis_aliases(tmp_path: Path, monkeypatch):
+    """It supports Aegis-compatible environment variable aliases."""
     for name in (
         "AUTH_MODE",
         "LLM_AUTH_MODE",

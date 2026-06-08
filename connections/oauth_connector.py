@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any
 
@@ -22,6 +22,15 @@ REFRESH_BUFFER_SECONDS = 300
 
 
 @dataclass(frozen=True)
+class OAuthRetryConfig:
+    """OAuth retry and timeout settings."""
+
+    max_retries: int = 3
+    retry_delay_seconds: float = 1.0
+    timeout_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class OAuthConfig:
     """OAuth client-credentials settings."""
 
@@ -30,9 +39,22 @@ class OAuthConfig:
     client_secret: str
     grant_type: str = "client_credentials"
     scope: str = ""
-    max_retries: int = 3
-    retry_delay_seconds: float = 1.0
-    timeout_seconds: float = 30.0
+    retry: OAuthRetryConfig = field(default_factory=OAuthRetryConfig)
+
+    @property
+    def max_retries(self) -> int:
+        """Return the configured token request retry limit."""
+        return self.retry.max_retries
+
+    @property
+    def retry_delay_seconds(self) -> float:
+        """Return the delay between failed token request attempts."""
+        return self.retry.retry_delay_seconds
+
+    @property
+    def timeout_seconds(self) -> float:
+        """Return the token request timeout."""
+        return self.retry.timeout_seconds
 
 
 def _should_retry_with_body_credentials(response: requests.Response) -> bool:

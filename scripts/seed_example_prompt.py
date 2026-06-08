@@ -4,11 +4,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
-from pathlib import Path
-
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utilities.config import load_config
 from utilities.logging_setup import setup_logging
@@ -26,9 +21,7 @@ EXAMPLE_PROMPT = {
     "system_prompt": (
         "You are a concise assistant helping validate a reusable LLM framework."
     ),
-    "user_prompt": (
-        "Reply with one short sentence explaining that the framework is wired correctly."
-    ),
+    "user_prompt": "Reply with one short sentence: the framework is wired correctly.",
     "tool_definition": None,
     "uses_global": [],
 }

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from connections.oauth_connector import OAuthConfig
+from connections.oauth_connector import OAuthConfig, OAuthRetryConfig
 
 AUTH_MODES = {"local", "oauth"}
 MODEL_SIZES = {"small", "large"}
@@ -20,6 +20,15 @@ class SSLConfig:
     """SSL configuration settings."""
 
     verify: bool
+
+
+@dataclass(frozen=True)
+class AuthConfig:
+    """Authentication settings for OpenAI-compatible APIs."""
+
+    mode: str
+    api_key: str
+    oauth: OAuthConfig
 
 
 @dataclass(frozen=True)
@@ -83,19 +92,49 @@ class ConversationConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeConfig:
+    """Process-level runtime settings."""
+
+    log_level: str
+    output_logs: bool
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Full application configuration."""
 
-    auth_mode: str
-    api_key: str
-    oauth: OAuthConfig
+    auth: AuthConfig
     ssl: SSLConfig
     database: DatabaseConfig
     llm: LLMConfig
     prompt: PromptConfig
     conversation: ConversationConfig
-    log_level: str
-    output_logs: bool
+    runtime: RuntimeConfig
+
+    @property
+    def auth_mode(self) -> str:
+        """Return the active authentication mode."""
+        return self.auth.mode
+
+    @property
+    def api_key(self) -> str:
+        """Return the configured local API key, if any."""
+        return self.auth.api_key
+
+    @property
+    def oauth(self) -> OAuthConfig:
+        """Return OAuth client-credentials settings."""
+        return self.auth.oauth
+
+    @property
+    def log_level(self) -> str:
+        """Return the configured logging level name."""
+        return self.runtime.log_level
+
+    @property
+    def output_logs(self) -> bool:
+        """Return whether file logging is enabled."""
+        return self.runtime.output_logs
 
 
 def load_config(
@@ -108,17 +147,29 @@ def load_config(
         load_env_file(path, override=override)
 
     return AppConfig(
-        auth_mode=_auth_mode(),
-        api_key=_env_any(["OPENAI_API_KEY", "API_KEY"], ""),
-        oauth=OAuthConfig(
-            token_endpoint=_env_any(["OAUTH_TOKEN_ENDPOINT", "OAUTH_ENDPOINT"], ""),
-            client_id=_env("OAUTH_CLIENT_ID", ""),
-            client_secret=_env("OAUTH_CLIENT_SECRET", ""),
-            grant_type=_env("OAUTH_GRANT_TYPE", "client_credentials"),
-            scope=_env("OAUTH_SCOPE", ""),
-            max_retries=_int("OAUTH_MAX_RETRIES", "3", minimum=1),
-            retry_delay_seconds=_float("OAUTH_RETRY_DELAY_SECONDS", "1.0", minimum=0.0),
-            timeout_seconds=_float("OAUTH_TIMEOUT_SECONDS", "30.0", minimum=0.0),
+        auth=AuthConfig(
+            mode=_auth_mode(),
+            api_key=_env_any(["OPENAI_API_KEY", "API_KEY"], ""),
+            oauth=OAuthConfig(
+                token_endpoint=_env_any(["OAUTH_TOKEN_ENDPOINT", "OAUTH_ENDPOINT"], ""),
+                client_id=_env("OAUTH_CLIENT_ID", ""),
+                client_secret=_env("OAUTH_CLIENT_SECRET", ""),
+                grant_type=_env("OAUTH_GRANT_TYPE", "client_credentials"),
+                scope=_env("OAUTH_SCOPE", ""),
+                retry=OAuthRetryConfig(
+                    max_retries=_int("OAUTH_MAX_RETRIES", "3", minimum=1),
+                    retry_delay_seconds=_float(
+                        "OAUTH_RETRY_DELAY_SECONDS",
+                        "1.0",
+                        minimum=0.0,
+                    ),
+                    timeout_seconds=_float(
+                        "OAUTH_TIMEOUT_SECONDS",
+                        "30.0",
+                        minimum=0.0,
+                    ),
+                ),
+            ),
         ),
         ssl=SSLConfig(
             verify=_bool("SSL_VERIFY", False),
@@ -153,8 +204,10 @@ def load_config(
             ),
             max_history_length=_int("MAX_HISTORY_LENGTH", "20", minimum=1),
         ),
-        log_level=_env("LOG_LEVEL", "INFO").upper(),
-        output_logs=_bool("OUTPUT_LOGS", False),
+        runtime=RuntimeConfig(
+            log_level=_env("LOG_LEVEL", "INFO").upper(),
+            output_logs=_bool("OUTPUT_LOGS", False),
+        ),
     )
 
 
@@ -385,9 +438,7 @@ def config_summary(config: AppConfig) -> dict[str, Any]:
         ),
         "ssl_verify": config.ssl.verify,
         "postgres_configured": bool(
-            config.database.host
-            and config.database.database
-            and config.database.user
+            config.database.host and config.database.database and config.database.user
         ),
         "postgres_host": config.database.host,
         "postgres_database": config.database.database,

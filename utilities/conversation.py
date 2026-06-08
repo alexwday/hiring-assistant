@@ -37,7 +37,8 @@ def normalize_messages(
         normalized.append(normalized_message)
 
     if len(normalized) > config.max_history_length:
-        normalized = normalized[-config.max_history_length :]
+        max_history_length = config.max_history_length
+        normalized = normalized[-max_history_length:]
     return normalized
 
 
@@ -70,4 +71,3 @@ def _normalize_message(message: Any, index: int) -> dict[str, str]:
     if not isinstance(content, str) or not content.strip():
         raise ValueError(f"Message at index {index} requires non-empty string content")
     return {"role": role, "content": content}
-

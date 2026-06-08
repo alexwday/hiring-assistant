@@ -1,92 +1,61 @@
+"""Tests for PostgreSQL prompt row validation and table checks."""
+
 import pytest
 
-from connections.oauth_connector import OAuthConfig
-from utilities.config import (
-    AppConfig,
-    ConversationConfig,
-    DatabaseConfig,
-    LLMConfig,
-    LLMModelConfig,
-    PromptConfig,
-    SSLConfig,
-)
+from tests.helpers import build_app_config
 from utilities.prompt_loader import ensure_prompts_table, validate_prompt_row
 
 
 class FakeCursor:
-    def __init__(self, result):
+    """Minimal context-manager cursor for prompt table checks."""
+
+    def __init__(self, result: str | None):
+        """Store a single fetch result."""
         self.result = result
         self.queries = []
 
     def __enter__(self):
+        """Return this cursor for context-manager usage."""
         return self
 
     def __exit__(self, *_):
+        """Do not suppress context-manager exceptions."""
         return False
 
-    def execute(self, query, params=None):
+    def execute(self, query, params=None) -> None:
+        """Record executed SQL and parameters."""
         self.queries.append((query, params))
 
-    def fetchone(self):
+    def fetchone(self) -> list[str | None]:
+        """Return one database-like row."""
         return [self.result]
 
 
 class FakeConnection:
-    def __init__(self, result):
+    """Minimal context-manager connection for prompt table checks."""
+
+    def __init__(self, result: str | None):
+        """Create one fake cursor for inspection."""
         self.cursor_obj = FakeCursor(result)
 
     def __enter__(self):
+        """Return this connection for context-manager usage."""
         return self
 
     def __exit__(self, *_):
+        """Do not suppress context-manager exceptions."""
         return False
 
     def cursor(self, *_, **__):
+        """Return the fake cursor."""
         return self.cursor_obj
 
-
-def _config():
-    model = LLMModelConfig(
-        model="test-model",
-        max_tokens=100,
-        timeout_seconds=30,
-        max_retries=0,
-        reasoning_effort=None,
-    )
-    return AppConfig(
-        auth_mode="local",
-        api_key="test-key",
-        oauth=OAuthConfig(token_endpoint="", client_id="", client_secret=""),
-        ssl=SSLConfig(verify=False),
-        database=DatabaseConfig(
-            host="127.0.0.1",
-            port=5432,
-            database="postgres",
-            user="postgres",
-            password="",
-            schema="public",
-        ),
-        llm=LLMConfig(
-            base_url="https://example.test/v1",
-            small=model,
-            large=model,
-        ),
-        prompt=PromptConfig(
-            model="base_llm_framework",
-            layer="default",
-            default_prompt="example",
-        ),
-        conversation=ConversationConfig(
-            include_system_messages=True,
-            allowed_roles=("system", "user", "assistant"),
-            max_history_length=20,
-        ),
-        log_level="INFO",
-        output_logs=False,
-    )
+    def commit(self) -> None:
+        """Provide a no-op commit method for DB-helper compatibility."""
 
 
 def test_validate_prompt_row_reads_metadata_and_tool_definition():
+    """It reads prompt metadata and normalizes tool definitions."""
     prompt = validate_prompt_row(
         {
             "model": "base_llm_framework",
@@ -127,6 +96,7 @@ def test_validate_prompt_row_reads_metadata_and_tool_definition():
 
 
 def test_prompt_render_reports_missing_variable():
+    """It raises a clear error when a template variable is missing."""
     prompt = validate_prompt_row(
         {
             "model": "base_llm_framework",
@@ -146,13 +116,14 @@ def test_prompt_render_reports_missing_variable():
 
 
 def test_ensure_prompts_table_checks_existing_table_without_ddl(monkeypatch):
+    """It checks table existence without attempting schema DDL."""
     fake_connection = FakeConnection("public.prompts")
     monkeypatch.setattr(
         "utilities.prompt_loader.connection_scope",
         lambda *_args, **_kwargs: fake_connection,
     )
 
-    ensure_prompts_table(config=_config())
+    ensure_prompts_table(config=build_app_config())
 
     query, params = fake_connection.cursor_obj.queries[0]
     assert "to_regclass" in query
@@ -161,6 +132,7 @@ def test_ensure_prompts_table_checks_existing_table_without_ddl(monkeypatch):
 
 
 def test_ensure_prompts_table_reports_missing_table(monkeypatch):
+    """It reports a missing prompts table before seeding."""
     fake_connection = FakeConnection(None)
     monkeypatch.setattr(
         "utilities.prompt_loader.connection_scope",
@@ -168,4 +140,4 @@ def test_ensure_prompts_table_reports_missing_table(monkeypatch):
     )
 
     with pytest.raises(FileNotFoundError, match="prompts table not found"):
-        ensure_prompts_table(config=_config())
+        ensure_prompts_table(config=build_app_config())

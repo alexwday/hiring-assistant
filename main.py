@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from dataclasses import replace
 from typing import Any
 
 from connections.llm_connector import (
@@ -139,8 +140,6 @@ def _parse_variables(raw_values: list[str]) -> dict[str, str]:
 
 def _replace_user_prompt(prompt, user_prompt: str):
     """Return a prompt copy with a runtime user prompt override."""
-    from dataclasses import replace
-
     return replace(prompt, user_prompt=user_prompt)
 
 

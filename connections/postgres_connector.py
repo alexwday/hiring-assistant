@@ -120,4 +120,3 @@ def _validate_database_config(config: AppConfig) -> None:
         missing.append("DB_USER or POSTGRES_USER")
     if missing:
         raise ValueError(f"Missing PostgreSQL config: {', '.join(missing)}")
-

@@ -32,7 +32,7 @@ cp .env.example .env
 Fill in `.env`, then validate without external calls:
 
 ```bash
-python scripts/seed_example_prompt.py
+python -m scripts.seed_example_prompt
 python main.py --dry-run
 ```
 

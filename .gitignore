@@ -1,6 +1,7 @@
 .env
 .DS_Store
 .pytest_cache/
+.pylint.d/
 __pycache__/
 *.py[cod]
 logs/

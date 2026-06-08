@@ -2,11 +2,14 @@
 testpaths = ["tests"]
 pythonpath = ["."]
 
+[tool.black]
+line-length = 88
+target-version = ["py313"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py313"
-src = ["connections", "utilities", "tests"]
+src = ["connections", "utilities", "scripts", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-

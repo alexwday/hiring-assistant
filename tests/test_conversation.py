@@ -1,8 +1,11 @@
+"""Tests for chat conversation normalization."""
+
 from utilities.config import ConversationConfig
 from utilities.conversation import normalize_messages
 
 
 def test_normalize_messages_filters_and_trims():
+    """It filters roles and keeps only the configured history length."""
     config = ConversationConfig(
         include_system_messages=False,
         allowed_roles=("user", "assistant"),
@@ -21,4 +24,3 @@ def test_normalize_messages_filters_and_trims():
         {"role": "assistant", "content": "two"},
         {"role": "user", "content": "three"},
     ]
-

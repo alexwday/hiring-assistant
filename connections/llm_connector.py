@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -28,6 +29,17 @@ def _is_reasoning_model(model: str) -> bool:
 def _prepare_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Clone tool definitions so callers can safely reuse prompt data."""
     return copy.deepcopy(tools or [])
+
+
+@dataclass(frozen=True)
+class ChatRequestConfig:
+    """Resolved model request settings for one chat completion call."""
+
+    model: str
+    max_tokens: int
+    temperature: float | None
+    reasoning_effort: str | None
+    reasoning_model: bool
 
 
 class LLMClient:
@@ -80,7 +92,9 @@ class LLMClient:
         """Return an OpenAI SDK client configured for the active auth mode."""
         if self.config.auth_mode == "local":
             if not self.config.api_key:
-                raise ValueError("OPENAI_API_KEY or API_KEY is required for AUTH_MODE=local")
+                raise ValueError(
+                    "OPENAI_API_KEY or API_KEY is required for AUTH_MODE=local"
+                )
             if self._openai_client is None:
                 self._openai_client = self._new_openai_client(self.config.api_key)
             return self._openai_client
@@ -140,29 +154,20 @@ class LLMClient:
         settings: dict[str, Any],
     ) -> dict[str, Any]:
         """Build OpenAI chat-completions request params."""
-        model_size = str(settings.get("model_size") or "small")
-        profile = self.config.llm.get_profile(model_size)
-        model = str(settings.get("model") or profile.model)
-        max_tokens = int(settings.get("max_tokens") or profile.max_tokens)
-        temperature = settings.get("temperature")
-        reasoning_effort = settings.get(
-            "reasoning_effort",
-            profile.reasoning_effort,
-        )
-        reasoning_model = _is_reasoning_model(model)
+        request_config = self._resolve_request_config(settings)
 
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": request_config.model,
             "messages": messages,
         }
-        if reasoning_model:
-            kwargs["max_completion_tokens"] = max_tokens
-            if reasoning_effort:
-                kwargs["reasoning_effort"] = reasoning_effort
+        if request_config.reasoning_model:
+            kwargs["max_completion_tokens"] = request_config.max_tokens
+            if request_config.reasoning_effort:
+                kwargs["reasoning_effort"] = request_config.reasoning_effort
         else:
-            kwargs["max_tokens"] = max_tokens
-            if temperature is not None:
-                kwargs["temperature"] = float(temperature)
+            kwargs["max_tokens"] = request_config.max_tokens
+            if request_config.temperature is not None:
+                kwargs["temperature"] = request_config.temperature
 
         prepared_tools = _prepare_tools(tools)
         if prepared_tools:
@@ -184,6 +189,23 @@ class LLMClient:
             if key in settings:
                 kwargs[key] = settings[key]
         return kwargs
+
+    def _resolve_request_config(self, settings: dict[str, Any]) -> ChatRequestConfig:
+        """Resolve prompt and environment settings for one chat request."""
+        model_size = str(settings.get("model_size") or "small")
+        profile = self.config.llm.get_profile(model_size)
+        model = str(settings.get("model") or profile.model)
+        temperature = settings.get("temperature")
+        return ChatRequestConfig(
+            model=model,
+            max_tokens=int(settings.get("max_tokens") or profile.max_tokens),
+            temperature=float(temperature) if temperature is not None else None,
+            reasoning_effort=settings.get(
+                "reasoning_effort",
+                profile.reasoning_effort,
+            ),
+            reasoning_model=_is_reasoning_model(model),
+        )
 
 
 def extract_message_text(response: dict[str, Any]) -> str:

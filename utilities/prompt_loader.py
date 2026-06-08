@@ -16,20 +16,86 @@ PROMPTS_TABLE = "prompts"
 
 
 @dataclass(frozen=True)
-class PromptDefinition:
-    """Validated prompt table content."""
+class PromptIdentity:
+    """Stable prompt table identity fields."""
 
     name: str
-    system_prompt: str
-    user_prompt: str
     model: str
     layer: str
+
+
+@dataclass(frozen=True)
+class PromptMetadata:
+    """Descriptive prompt table metadata."""
+
     description: str = ""
     version: str = ""
+
+
+@dataclass(frozen=True)
+class PromptRuntime:
+    """Prompt-level LLM runtime settings."""
+
     model_size: str = "small"
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     settings: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class PromptDefinition:
+    """Validated prompt table content."""
+
+    identity: PromptIdentity
+    system_prompt: str
+    user_prompt: str
+    metadata: PromptMetadata
+    runtime: PromptRuntime
+
+    @property
+    def name(self) -> str:
+        """Return the prompt name."""
+        return self.identity.name
+
+    @property
+    def model(self) -> str:
+        """Return the prompt model namespace."""
+        return self.identity.model
+
+    @property
+    def layer(self) -> str:
+        """Return the prompt layer."""
+        return self.identity.layer
+
+    @property
+    def description(self) -> str:
+        """Return the prompt description."""
+        return self.metadata.description
+
+    @property
+    def version(self) -> str:
+        """Return the prompt version."""
+        return self.metadata.version
+
+    @property
+    def model_size(self) -> str:
+        """Return the selected LLM model profile size."""
+        return self.runtime.model_size
+
+    @property
+    def tools(self) -> list[dict[str, Any]] | None:
+        """Return normalized OpenAI tool definitions."""
+        return self.runtime.tools
+
+    @property
+    def tool_choice(self) -> str | dict[str, Any] | None:
+        """Return the prompt tool choice, if configured."""
+        return self.runtime.tool_choice
+
+    @property
+    def settings(self) -> dict[str, Any] | None:
+        """Return prompt-level LLM request settings."""
+        return self.runtime.settings
 
     def messages(self) -> list[dict[str, str]]:
         """Return system and user messages for the chat API."""
@@ -40,13 +106,15 @@ class PromptDefinition:
 
     def llm_settings(self) -> dict[str, Any]:
         """Return LLM request settings with the selected model profile."""
-        return {**(self.settings or {}), "model_size": self.model_size}
+        return {**(self.runtime.settings or {}), "model_size": self.runtime.model_size}
 
     def render(self, variables: dict[str, Any]) -> "PromptDefinition":
         """Format prompt templates with supplied variables."""
         return replace(
             self,
-            system_prompt=_format_template(self.system_prompt, variables, "system_prompt"),
+            system_prompt=_format_template(
+                self.system_prompt, variables, "system_prompt"
+            ),
             user_prompt=_format_template(self.user_prompt, variables, "user_prompt"),
         )
 
@@ -128,17 +196,23 @@ def validate_prompt_row(
             system_prompt = "\n\n---\n\n".join([*global_prompts, system_prompt])
 
     return PromptDefinition(
-        name=_required_str(row, "name"),
-        model=_required_str(row, "model"),
-        layer=_required_str(row, "layer"),
-        description=_optional_str(row.get("description")),
-        version=_optional_str(row.get("version")),
-        model_size=_model_size(metadata.get("model_size")),
+        identity=PromptIdentity(
+            name=_required_str(row, "name"),
+            model=_required_str(row, "model"),
+            layer=_required_str(row, "layer"),
+        ),
+        metadata=PromptMetadata(
+            description=_optional_str(row.get("description")),
+            version=_optional_str(row.get("version")),
+        ),
+        runtime=PromptRuntime(
+            model_size=_model_size(metadata.get("model_size")),
+            tools=_normalize_tools(row.get("tool_definition")),
+            tool_choice=metadata.get("tool_choice"),
+            settings=_normalize_settings(metadata.get("settings")),
+        ),
         system_prompt=system_prompt,
         user_prompt=_required_str(row, "user_prompt"),
-        tools=_normalize_tools(row.get("tool_definition")),
-        tool_choice=metadata.get("tool_choice"),
-        settings=_normalize_settings(metadata.get("settings")),
     )
 
 
@@ -278,7 +352,9 @@ def _prompt_write_params(prompt: dict[str, Any]) -> dict[str, Any]:
         "comments": json.dumps(metadata, sort_keys=True),
         "system_prompt": prompt["system_prompt"],
         "user_prompt": prompt["user_prompt"],
-        "tool_definition": Json(tool_definition) if tool_definition is not None else None,
+        "tool_definition": (
+            Json(tool_definition) if tool_definition is not None else None
+        ),
         "uses_global": prompt.get("uses_global") or [],
         "version": prompt.get("version", "1.0.0"),
     }

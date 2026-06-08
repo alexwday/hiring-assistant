@@ -14,32 +14,22 @@ SECRET_PATTERNS = (
         r"([\"']?\s*[:=]\s*[\"']?)([^\"'\s,;]+)"
     ),
 )
-
-_CONFIGURED = False
-
-
-class RedactingFilter(logging.Filter):
-    """Redact common secret-bearing key/value pairs from log records."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        """Mutate the record message when redaction is needed."""
-        message = record.getMessage()
-        redacted = redact(message)
-        if redacted != message:
-            record.msg = redacted
-            record.args = ()
-        return True
+_LOGGING_STATE = {"configured": False}
 
 
 class ConsoleFormatter(logging.Formatter):
     """Compact console formatter."""
 
-    def formatTime(self, record, datefmt=None):
+    def formatTime(
+        self,
+        record: logging.LogRecord,
+        datefmt: str | None = None,
+    ) -> str:
         """Format record timestamps in local time."""
         created = datetime.fromtimestamp(record.created)
         return created.strftime(datefmt or "%Y-%m-%d %H:%M:%S")
 
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
         """Return one log line."""
         timestamp = self.formatTime(record)
         return f"{timestamp} | {record.levelname:<8} | {record.getMessage()}"
@@ -52,19 +42,17 @@ def setup_logging(
     force: bool = False,
 ) -> Path | None:
     """Configure root logging and return the file log path when enabled."""
-    global _CONFIGURED
-    if _CONFIGURED and not force:
+    if _LOGGING_STATE["configured"] and not force:
         return None
 
     logger = logging.getLogger()
     logger.setLevel(_coerce_level(level))
     logger.handlers.clear()
 
-    redacting_filter = RedactingFilter()
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(_coerce_level(level))
     console.setFormatter(ConsoleFormatter())
-    console.addFilter(redacting_filter)
+    console.addFilter(redact_record)
     logger.addHandler(console)
 
     log_file = None
@@ -79,14 +67,24 @@ def setup_logging(
                 "%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d | %(message)s"
             )
         )
-        file_handler.addFilter(redacting_filter)
+        file_handler.addFilter(redact_record)
         logger.addHandler(file_handler)
 
     for noisy_logger in ("httpcore", "httpx", "openai", "urllib3"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
-    _CONFIGURED = True
+    _LOGGING_STATE["configured"] = True
     return log_file
+
+
+def redact_record(record: logging.LogRecord) -> bool:
+    """Redact common secret-bearing key/value pairs from a log record."""
+    message = record.getMessage()
+    redacted = redact(message)
+    if redacted != message:
+        record.msg = redacted
+        record.args = ()
+    return True
 
 
 def redact(message: str) -> str:
@@ -105,4 +103,3 @@ def _coerce_level(level: int | str) -> int:
     if isinstance(value, int):
         return value
     raise ValueError(f"Unknown logging level: {level!r}")
-
