@@ -3928,6 +3928,21 @@ def _page(title: str, body: str) -> str:
       line-height: 1.5;
       font-size: 15px;
     }}
+    .export-shell .document-header {{
+      padding: 18px 22px;
+    }}
+    .export-shell .document-header h1 {{
+      font-size: 23px;
+    }}
+    .export-shell .document-header p {{
+      font-size: 13px;
+      line-height: 1.4;
+    }}
+    .export-shell .export-body {{
+      gap: 12px;
+      padding: 16px 18px 22px;
+      font-size: 13px;
+    }}
     .review-section {{
       display: grid;
       gap: 10px;
@@ -4044,11 +4059,11 @@ def _page(title: str, body: str) -> str:
     .export-details-body {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: 14px;
+      gap: 10px;
       min-width: 620px;
       max-width: 1320px;
       margin-top: 12px;
-      padding: 12px;
+      padding: 10px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--surface-soft);
@@ -4058,15 +4073,15 @@ def _page(title: str, body: str) -> str:
     }}
     .export-pane {{
       min-width: 0;
-      padding: 14px;
+      padding: 10px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #ffffff;
     }}
     .export-pane h2,
     .final-rerank-record h2 {{
-      margin: 0 0 12px;
-      font-size: 16px;
+      margin: 0 0 9px;
+      font-size: 14px;
     }}
     .pdf-pane {{
       grid-column: 1 / -1;
@@ -4080,13 +4095,13 @@ def _page(title: str, body: str) -> str:
     }}
     .final-rerank-note,
     .final-rerank-record {{
-      padding: 12px;
+      padding: 10px;
       border: 1px solid #a7e3d8;
       border-radius: 8px;
       background: #ecfdf9;
     }}
     .export-context {{
-      padding: 14px;
+      padding: 10px 12px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: var(--surface-soft);
@@ -4094,25 +4109,25 @@ def _page(title: str, body: str) -> str:
     .export-context summary {{
       cursor: pointer;
       color: var(--text);
-      font-size: 16px;
+      font-size: 14px;
       font-weight: 900;
     }}
     .export-context-grid {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 12px;
-      margin-top: 12px;
+      gap: 10px;
+      margin-top: 10px;
     }}
     .export-context-card {{
       min-width: 0;
-      padding: 12px;
+      padding: 10px;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #ffffff;
     }}
     .export-context-card h2 {{
-      margin: 0 0 10px;
-      font-size: 16px;
+      margin: 0 0 8px;
+      font-size: 14px;
     }}
     .export-context-card pre {{
       max-height: 420px;
@@ -4127,15 +4142,55 @@ def _page(title: str, body: str) -> str:
       grid-column: 1 / -1;
     }}
     .decision-summary {{
-      margin: 8px 0 10px;
+      margin: 6px 0 8px;
       color: var(--text);
-      font-size: 16px;
+      font-size: 14px;
       font-weight: 800;
       line-height: 1.4;
     }}
     .compact-markdown {{
       padding: 0;
-      font-size: 14px;
+      font-size: 13px;
+    }}
+    .export-details-body .review-section {{
+      gap: 8px;
+    }}
+    .export-details-body .review-section h2 {{
+      padding-bottom: 5px;
+      font-size: 15px;
+    }}
+    .export-details-body .review-section h3 {{
+      font-size: 13px;
+    }}
+    .export-details-body .score-dashboard {{
+      grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+      gap: 7px;
+    }}
+    .export-details-body .score-tile {{
+      min-height: 68px;
+      padding: 8px;
+    }}
+    .export-details-body .score-tile span {{
+      font-size: 10px;
+    }}
+    .export-details-body .score-tile strong {{
+      margin-top: 5px;
+      font-size: 21px;
+    }}
+    .export-details-body .text-tile {{
+      min-width: 120px;
+    }}
+    .export-details-body .text-tile strong {{
+      font-size: 13px;
+    }}
+    .export-details-body .tradeoff-summary,
+    .export-details-body .education-entry,
+    .export-details-body .project-entry {{
+      padding: 9px;
+    }}
+    .export-details-body .prescreen-email pre {{
+      padding: 9px;
+      font-size: 12px;
     }}
     .reviewed-export-scroll {{
       width: 100%;
@@ -4153,19 +4208,68 @@ def _page(title: str, body: str) -> str:
       outline-offset: 2px;
     }}
     .reviewed-export-table {{
-      min-width: 1580px;
+      min-width: 1480px;
       margin: 0;
+      table-layout: fixed;
+      font-size: 12px;
     }}
     .reviewed-export-table th,
     .reviewed-export-table td {{
+      padding: 7px 8px;
+      line-height: 1.35;
       vertical-align: top;
+      overflow-wrap: anywhere;
     }}
+    .reviewed-export-table th:first-child,
     .reviewed-export-table td:first-child {{
-      min-width: 260px;
+      width: 185px;
+      min-width: 185px;
+    }}
+    .reviewed-export-table th:nth-child(2),
+    .reviewed-export-table td:nth-child(2) {{
+      width: 125px;
+    }}
+    .reviewed-export-table th:nth-child(3),
+    .reviewed-export-table td:nth-child(3) {{
+      width: 125px;
+    }}
+    .reviewed-export-table th:nth-child(4),
+    .reviewed-export-table td:nth-child(4) {{
+      width: 72px;
+    }}
+    .reviewed-export-table th:nth-child(5),
+    .reviewed-export-table td:nth-child(5),
+    .reviewed-export-table th:nth-child(6),
+    .reviewed-export-table td:nth-child(6),
+    .reviewed-export-table th:nth-child(9),
+    .reviewed-export-table td:nth-child(9),
+    .reviewed-export-table th:nth-child(10),
+    .reviewed-export-table td:nth-child(10),
+    .reviewed-export-table th:nth-child(11),
+    .reviewed-export-table td:nth-child(11) {{
+      width: 54px;
+      text-align: center;
+    }}
+    .reviewed-export-table th:nth-child(7),
+    .reviewed-export-table td:nth-child(7) {{
+      width: 64px;
+      text-align: center;
+    }}
+    .reviewed-export-table th:nth-child(8),
+    .reviewed-export-table td:nth-child(8) {{
+      width: 280px;
+    }}
+    .reviewed-export-table th:nth-child(12),
+    .reviewed-export-table td:nth-child(12) {{
+      width: 112px;
+    }}
+    .reviewed-export-table th:nth-child(n+13),
+    .reviewed-export-table td:nth-child(n+13) {{
+      width: 68px;
     }}
     .reviewed-export-table .summary-cell {{
-      min-width: 360px;
-      max-width: 520px;
+      min-width: 260px;
+      max-width: 320px;
       white-space: normal;
     }}
     .candidate-details-row td {{
