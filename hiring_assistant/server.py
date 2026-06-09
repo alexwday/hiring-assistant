@@ -2296,7 +2296,7 @@ def _export_context_html(project: dict[str, Any]) -> str:
     work_context = str(project.get("work_context") or "").strip()
     return f"""
     <section class="export-context">
-      <details open>
+      <details>
         <summary>Job description and screening context</summary>
         <div class="export-context-grid">
           <article class="export-context-card">

@@ -168,6 +168,8 @@ def test_reviewed_export_html_has_expandable_rows_and_links(tmp_path):
 
     assert "Reviewed Results Export" in html
     assert "<details class=\"export-details\">" in html
+    assert "<summary>Job description and screening context</summary>" in html
+    assert "<details open>" not in html
     assert "reviewed-export-scroll" in html
     assert "/projects/project-1/files/b" in html
     assert "/projects/project-1/documents/b/review" in html
