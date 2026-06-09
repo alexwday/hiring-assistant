@@ -113,6 +113,7 @@ AUTH_MODE=local
 OPENAI_API_KEY=
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL_SMALL=gpt-5.4-mini
+LLM_MAX_TOKENS_SMALL=32768
 SSL_VERIFY=false
 ```
 
@@ -128,7 +129,9 @@ SSL_VERIFY=true
 ```
 
 The small model profile is used for resume vision extraction, metadata
-extraction, and candidate review.
+extraction, candidate review, and final top-10 reranking. Final reranking uses
+`LLM_MAX_TOKENS_SMALL` as the model's completion-token limit, so keep it high
+enough for the larger top-10 comparative prompt.
 
 ## LLM Concurrency
 

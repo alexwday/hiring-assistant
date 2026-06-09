@@ -1,8 +1,11 @@
 """Tests for resume LLM workflow helpers."""
 
+import pytest
+
 from hiring_assistant.llm_workflows import (
     _normalize_review_payload,
     _remove_pii_metadata,
+    parse_json_response,
     render_review_markdown,
 )
 
@@ -119,3 +122,24 @@ def test_review_markdown_renders_one_decimal_scores():
     assert "- Led workflow intake redesign." in markdown
     assert "Hiring Manager Notes" not in markdown
     assert "This should not render." not in markdown
+
+
+def test_parse_json_response_reports_empty_llm_content():
+    """It turns blank model output into an actionable workflow error."""
+    response = {
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {"role": "assistant", "content": ""},
+            }
+        ],
+        "usage": {"prompt_tokens": 12000, "completion_tokens": 5000},
+    }
+
+    with pytest.raises(ValueError) as exc_info:
+        parse_json_response(response, "final rerank")
+
+    message = str(exc_info.value)
+    assert "final rerank returned an empty LLM response" in message
+    assert "finish_reason=length" in message
+    assert "completion_tokens=5000" in message

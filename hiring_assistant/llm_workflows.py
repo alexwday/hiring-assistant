@@ -323,8 +323,7 @@ class ResumeLLMService:
                 "response_format": {"type": "json_object"},
             },
         )
-        text = extract_message_text(response)
-        payload = parse_json_object(text)
+        payload = parse_json_response(response, "metadata extraction")
         return _remove_pii_metadata(payload)
 
     def _review_payload(
@@ -484,8 +483,7 @@ class ResumeLLMService:
                 "response_format": {"type": "json_object"},
             },
         )
-        text = extract_message_text(response)
-        payload = parse_json_object(text)
+        payload = parse_json_response(response, "resume review")
         return _normalize_review_payload(_remove_pii_metadata(payload))
 
     def _final_rerank_payload(
@@ -561,11 +559,10 @@ class ResumeLLMService:
             messages=messages,
             settings={
                 "model_size": "small",
-                "max_tokens": 5000,
                 "response_format": {"type": "json_object"},
             },
         )
-        payload = parse_json_object(extract_message_text(response))
+        payload = parse_json_response(response, "final rerank")
         return _normalize_final_rerank_payload(payload, candidates)
 
     def _combine_page_markdown(
@@ -595,6 +592,51 @@ def parse_json_object(text: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("LLM response was not a JSON object")
     return payload
+
+
+def parse_json_response(response: dict[str, Any], workflow_name: str) -> dict[str, Any]:
+    """Parse a JSON object response with useful LLM diagnostics."""
+    text = extract_message_text(response).strip()
+    if not text:
+        raise ValueError(
+            f"{workflow_name} returned an empty LLM response "
+            f"({_response_diagnostics(response)}). Increase the model "
+            "completion-token limit or reduce the prompt size."
+        )
+    try:
+        return parse_json_object(text)
+    except json.JSONDecodeError as exc:
+        preview = text[:500].replace("\n", "\\n")
+        raise ValueError(
+            f"{workflow_name} returned non-JSON text "
+            f"({_response_diagnostics(response)}): {preview!r}"
+        ) from exc
+
+
+def _response_diagnostics(response: dict[str, Any]) -> str:
+    choices = response.get("choices") or []
+    if not choices:
+        return "choices=0"
+    first = choices[0] or {}
+    finish_reason = first.get("finish_reason", "")
+    message = first.get("message") or {}
+    content = message.get("content")
+    content_type = type(content).__name__
+    refusal = message.get("refusal")
+    details = [
+        f"finish_reason={finish_reason or 'unknown'}",
+        f"content_type={content_type}",
+    ]
+    if refusal:
+        details.append("refusal_present=true")
+    usage = response.get("usage") or {}
+    completion_tokens = usage.get("completion_tokens")
+    prompt_tokens = usage.get("prompt_tokens")
+    if prompt_tokens is not None:
+        details.append(f"prompt_tokens={prompt_tokens}")
+    if completion_tokens is not None:
+        details.append(f"completion_tokens={completion_tokens}")
+    return ", ".join(details)
 
 
 def _guarded_llm_call(
