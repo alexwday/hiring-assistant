@@ -273,6 +273,11 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
 
     def _render_project(self, project_id: str, query: dict[str, list[str]]) -> str:
         project = self.server.store.load_project(project_id)
+        project = _backfill_candidate_name_hints(
+            self.server.store,
+            project_id,
+            project,
+        )
         documents = project.get("documents", [])
         uploaded = [
             doc
@@ -600,6 +605,11 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         query: dict[str, list[str]],
     ) -> None:
         project = self.server.store.load_project(project_id)
+        project = _backfill_candidate_name_hints(
+            self.server.store,
+            project_id,
+            project,
+        )
         reviewed = [
             document
             for document in project.get("documents", [])
@@ -1361,7 +1371,6 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             original_pdf_deleted=True,
             original_filename=_privacy_filename(document),
             stored_filename=f"{document_id}.pdf",
-            candidate_name_hint="",
             pii_error="",
             processing_error="",
         )
@@ -3135,8 +3144,63 @@ def _document_label(document: dict[str, Any]) -> str:
     return f"Document {str(document.get('id', ''))[:8]}"
 
 
+def _backfill_candidate_name_hints(
+    store: ProjectStore,
+    project_id: str,
+    project: dict[str, Any],
+) -> dict[str, Any]:
+    package_names = _package_candidate_name_map(project)
+    changed = False
+    for document in project.get("documents", []):
+        if str(document.get("candidate_name_hint") or "").strip():
+            continue
+        candidate_id = str(document.get("candidate_id") or "").strip()
+        if not candidate_id:
+            continue
+        source_package_id = str(document.get("source_package_id") or "").strip()
+        candidate_name = package_names.get((source_package_id, candidate_id))
+        if not candidate_name:
+            candidate_name = _candidate_name_from_old_privacy_filename(document)
+        if not candidate_name:
+            continue
+        document["candidate_name_hint"] = candidate_name
+        changed = True
+    if changed:
+        store.save_project(project)
+    return project
+
+
+def _package_candidate_name_map(project: dict[str, Any]) -> dict[tuple[str, str], str]:
+    names: dict[tuple[str, str], str] = {}
+    for package in project.get("packages", []):
+        package_id = str(package.get("id") or "").strip()
+        for row in package.get("candidate_rows") or []:
+            if not isinstance(row, dict):
+                continue
+            candidate_id = str(row.get("candidate_id") or "").strip()
+            candidate_name = str(row.get("candidate_name") or "").strip()
+            if package_id and candidate_id and candidate_name:
+                names[(package_id, candidate_id)] = candidate_name
+    return names
+
+
+def _candidate_name_from_old_privacy_filename(
+    document: dict[str, Any],
+) -> str:
+    stem = Path(str(document.get("original_filename") or "")).stem
+    marker = "-|-candidate-"
+    if marker not in stem:
+        return ""
+    raw_name = stem.split(marker, 1)[0]
+    parts = [part for part in raw_name.split("-") if part]
+    return " ".join(part[:1].upper() + part[1:] for part in parts)
+
+
 def _privacy_filename(document: dict[str, Any]) -> str:
-    return f"{_document_label(document).lower().replace(' ', '-')}.pdf"
+    candidate_id = str(document.get("candidate_id") or "").strip()
+    if candidate_id:
+        return f"candidate-{candidate_id.lower()}.pdf"
+    return f"document-{str(document.get('id', ''))[:8]}.pdf"
 
 
 def _candidate_name_hints(document: dict[str, Any]) -> list[str]:
