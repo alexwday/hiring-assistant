@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
 import logging
@@ -176,6 +177,12 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                 if action == "review":
                     self._review_resumes(project_id)
                     return
+                if action == "rerun-review":
+                    self._rerun_reviewed_resumes(project_id)
+                    return
+                if action == "final-rerank":
+                    self._final_rerank_reviewed(project_id)
+                    return
             if (
                 len(segments) == 5
                 and segments[0] == "projects"
@@ -336,13 +343,20 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                     <p class="muted">Completed job-fit reports and scores.</p>
                   </div>
                   <div class="panel-actions">
+                    <form method="post"
+                          action="/projects/{quote(project_id)}/final-rerank"
+                          class="inline-action-form">
+                      <button type="submit" class="secondary-button compact-button">
+                        Run final top-10 rerank
+                      </button>
+                    </form>
                     <a class="secondary-link" href="{reviewed_export_href}">
                       Export HTML
                     </a>
                     <span class="count-pill">{len(reviewed)}</span>
                   </div>
                 </div>
-                {_reviewed_table(project_id, reviewed)}
+                {_reviewed_table(project_id, project, reviewed)}
               </section>
             </section>
             <aside class="right-pane">
@@ -593,6 +607,7 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             project,
             reviewed,
             self.server.store,
+            static=bool(_first(query, "download")),
         )
         if _first(query, "download"):
             filename = f"{project_id}-reviewed-results.html"
@@ -910,6 +925,92 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
     def _review_resumes(self, project_id: str) -> None:
         form, _files = self._parse_post()
         document_ids = form.get("document_id", [])
+        self._start_review_batch(
+            project_id=project_id,
+            document_ids=document_ids,
+            allowed_statuses={"processed"},
+            empty_message="Select at least one processed resume",
+            invalid_message="Only processed resumes can be reviewed",
+            action_label="Reviewing",
+        )
+
+    def _rerun_reviewed_resumes(self, project_id: str) -> None:
+        form, _files = self._parse_post()
+        document_ids = form.get("document_id", [])
+        self._start_review_batch(
+            project_id=project_id,
+            document_ids=document_ids,
+            allowed_statuses={"reviewed"},
+            empty_message="Select at least one reviewed resume",
+            invalid_message="Only reviewed resumes can be rerun",
+            action_label="Rerunning review for",
+            rerun=True,
+        )
+
+    def _final_rerank_reviewed(self, project_id: str) -> None:
+        try:
+            project = self.server.store.load_project(project_id)
+            if not project.get("job_posting", "").strip():
+                self._redirect_project(
+                    project_id,
+                    "Save a job posting before final rerank",
+                    "error",
+                )
+                return
+            reviewed = [
+                document
+                for document in project.get("documents", [])
+                if document.get("status") == "reviewed"
+            ]
+            ranked = _rank_reviewed_documents(reviewed)[:10]
+            if not ranked:
+                self._redirect_project(
+                    project_id,
+                    "Review at least one resume before final rerank",
+                    "error",
+                )
+                return
+            candidates = _final_rerank_candidate_records(
+                self.server.store,
+                project_id,
+                ranked,
+            )
+            service = ResumeLLMService(self.server.config, self.server.ssl_setup)
+            result = service.final_rerank_candidates(
+                candidates=candidates,
+                job_posting=project.get("job_posting", ""),
+                work_context=project.get("work_context", ""),
+            )
+            project = self.server.store.load_project(project_id)
+            project["final_rerank"] = {
+                "created_at": utc_now(),
+                "candidate_count": len(candidates),
+                "prompt_versions": result.prompt_versions,
+                "payload": result.payload,
+            }
+            project["final_rerank_error"] = ""
+            self.server.store.save_project(project)
+            self._redirect_project(
+                project_id,
+                f"Final rerank complete for top {len(candidates)} candidates",
+            )
+        except Exception as exc:
+            logger.exception("Final rerank failed")
+            project = self.server.store.load_project(project_id)
+            project["final_rerank_error"] = str(exc)
+            self.server.store.save_project(project)
+            self._redirect_project(project_id, f"Final rerank failed: {exc}", "error")
+
+    def _start_review_batch(
+        self,
+        project_id: str,
+        document_ids: list[str],
+        allowed_statuses: set[str],
+        empty_message: str,
+        invalid_message: str,
+        action_label: str,
+        rerun: bool = False,
+    ) -> None:
         project = self.server.store.load_project(project_id)
         if not project.get("job_posting", "").strip():
             self._redirect_project(
@@ -919,13 +1020,8 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             )
             return
         if not document_ids:
-            self._redirect_project(
-                project_id,
-                "Select at least one processed resume",
-                "error",
-            )
+            self._redirect_project(project_id, empty_message, "error")
             return
-
         reviewing_count = 0
         failed_count = 0
         reviewing_ids = []
@@ -935,14 +1031,15 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                     self.server.store.load_project(project_id),
                     document_id,
                 )
-                if document.get("status") != "processed":
-                    raise ValueError("Only processed resumes can be reviewed")
+                if document.get("status") not in allowed_statuses:
+                    raise ValueError(invalid_message)
                 self.server.store.update_document(
                     project_id,
                     document_id,
                     status="reviewing",
                     review_started_at=utc_now(),
                     review_error="",
+                    rerun_review=rerun,
                 )
                 reviewing_ids.append(document_id)
                 reviewing_count += 1
@@ -961,7 +1058,7 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                 daemon=True,
             ).start()
         level = "error" if failed_count and not reviewing_count else "info"
-        message = f"Reviewing {reviewing_count}; failed {failed_count}"
+        message = f"{action_label} {reviewing_count}; failed {failed_count}"
         self._redirect_project(project_id, message, level)
 
     def _split_package(self, project_id: str, package_id: str) -> None:
@@ -1071,11 +1168,20 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                 self._review_one_resume(project_id, document_id, service)
             except Exception as exc:
                 logger.exception("Background resume review failed: %s", document_id)
+                fallback_status = "processed"
+                try:
+                    project = self.server.store.load_project(project_id)
+                    document = self.server.store.get_document(project, document_id)
+                    if document.get("rerun_review"):
+                        fallback_status = "reviewed"
+                except KeyError:
+                    pass
                 self.server.store.update_document(
                     project_id,
                     document_id,
-                    status="processed",
+                    status=fallback_status,
                     review_error=str(exc),
+                    rerun_review=False,
                 )
 
     def _screen_one_resume(self, project_id: str, document_id: str) -> None:
@@ -1311,6 +1417,7 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             review_json_path=review_json_rel,
             scores=review.scores,
             review_error="",
+            rerun_review=False,
             prompt_versions=prompt_versions,
         )
         _rerank_reviewed_recommendations(self.server.store, project_id)
@@ -1849,18 +1956,86 @@ def _rank_reviewed_documents(
     return result
 
 
-def _reviewed_table(project_id: str, documents: list[dict[str, Any]]) -> str:
+def _ranked_review_rows(
+    project: dict[str, Any],
+    documents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ranked = _rank_reviewed_documents(documents)
+    adjusted = _final_rerank_map(project)
+    top_ten = ranked[:10]
+    remainder = ranked[10:]
+    for item in top_ten:
+        record = adjusted.get(item["document"]["id"])
+        item["adjusted_rank"] = record.get("adjusted_rank") if record else None
+        item["rerank_record"] = record or {}
+        item["top_ten"] = True
+    for item in remainder:
+        item["adjusted_rank"] = None
+        item["rerank_record"] = {}
+        item["top_ten"] = False
+    if adjusted:
+        top_ten.sort(
+            key=lambda item: (
+                item["adjusted_rank"] is not None,
+                -(item["adjusted_rank"] or 999),
+                -int(item["rank"]),
+            ),
+            reverse=True,
+        )
+    return top_ten + remainder
+
+
+def _final_rerank_map(project: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    payload = (project.get("final_rerank") or {}).get("payload") or {}
+    records = payload.get("adjusted_rankings") or []
+    if not isinstance(records, list):
+        return {}
+    mapped = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        candidate_key = str(record.get("candidate_key") or "").strip()
+        if candidate_key:
+            mapped[candidate_key] = record
+    return mapped
+
+
+def _adjusted_rank_label(ranked: dict[str, Any]) -> str:
+    adjusted_rank = ranked.get("adjusted_rank")
+    if not adjusted_rank:
+        return ""
+    return f"#{adjusted_rank}"
+
+
+def _rerank_decision_summary(ranked: dict[str, Any]) -> str:
+    record = ranked.get("rerank_record") or {}
+    return str(record.get("decision_summary") or "").strip()
+
+
+def _reviewed_table(
+    project_id: str,
+    project: dict[str, Any],
+    documents: list[dict[str, Any]],
+) -> str:
     rows = []
-    for ranked in _rank_reviewed_documents(documents):
+    for ranked in _ranked_review_rows(project, documents):
         document = ranked["document"]
         scores = document.get("scores") or {}
+        metadata = document.get("metadata") or {}
         review_href = _document_view_href(project_id, document["id"], "review")
         markdown_href = _document_view_href(project_id, document["id"], "markdown")
+        row_class = " class=\"top-ten-row\"" if ranked["top_ten"] else ""
         rows.append(
-            "<tr>"
+            f"<tr{row_class}>"
+            f"<td>{_checkbox(document['id'])}</td>"
             f"<td>{_candidate_label(project_id, document)}</td>"
+            f"<td>{_h(metadata.get('current_or_recent_title', ''))}</td>"
+            f"<td>{_h(metadata.get('current_or_recent_employer', ''))}</td>"
+            f"<td>{_h(metadata.get('years_of_experience_estimate', ''))}</td>"
             f"<td class=\"flag-cell\">{_canada_flag(scores)}</td>"
             f"<td>{_h(ranked['rank'])}</td>"
+            f"<td>{_h(_adjusted_rank_label(ranked))}</td>"
+            f"<td class=\"summary-cell\">{_h(_rerank_decision_summary(ranked))}</td>"
             f"<td>{_h(_score(scores.get('aggregate')))}</td>"
             f"<td>{_h(_score(scores.get('holistic')))}</td>"
             f"<td>{_h(_score(ranked['average']))}</td>"
@@ -1870,18 +2045,28 @@ def _reviewed_table(project_id: str, documents: list[dict[str, Any]]) -> str:
             "</tr>"
         )
     if not rows:
-        rows.append(_empty_row(9, "No reviewed resumes."))
+        rows.append(_empty_row(15, "No reviewed resumes."))
+    disabled = " disabled" if not documents else ""
     return f"""
-    <table>
-      <thead>
-        <tr>
-          <th>Candidate</th><th>Canada</th><th>Rank</th>
-          <th>Aggregate</th><th>Holistic</th><th>Avg</th>
-          <th>Recommendation</th><th>Report</th><th>Markdown</th>
-        </tr>
-      </thead>
-      <tbody>{''.join(rows)}</tbody>
-    </table>
+    <form method="post" action="/projects/{quote(project_id)}/rerun-review"
+          class="selection-form">
+      <table>
+        <thead>
+          <tr>
+            <th>{_select_all_checkbox()}</th><th>Candidate</th>
+            <th>Recent role</th><th>Employer</th><th>Experience</th>
+            <th>Canada</th><th>Rank</th><th>Adjusted</th>
+            <th>Final thesis</th><th>Aggregate</th><th>Holistic</th><th>Avg</th>
+            <th>Recommendation</th><th>Report</th><th>Markdown</th>
+          </tr>
+        </thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+      <div class="table-action">
+        {_selection_buttons()}
+        <button type="submit"{disabled}>Rerun selected reviews</button>
+      </div>
+    </form>
     """
 
 
@@ -1890,72 +2075,275 @@ def _reviewed_export_html(
     project: dict[str, Any],
     reviewed: list[dict[str, Any]],
     store: ProjectStore,
+    static: bool = False,
 ) -> str:
-    rows = []
-    for ranked in _rank_reviewed_documents(reviewed):
+    top_rows = []
+    lower_rows = []
+    ranked_rows = _ranked_review_rows(project, reviewed)
+    for ranked in ranked_rows:
         document = ranked["document"]
         scores = document.get("scores") or {}
+        metadata = document.get("metadata") or {}
         payload = _load_review_payload(store, project_id, document)
         if payload:
             _overlay_payload_scores(payload, document)
-        resume_href = _document_file_href(project_id, document["id"])
-        report_href = _document_view_href(project_id, document["id"], "review")
-        markdown_href = _document_view_href(project_id, document["id"], "markdown")
-        rows.append(
-            "<tr>"
+        markdown_text = _document_text(store, project_id, document, "markdown_path")
+        pdf_data_url = ""
+        if static and ranked["top_ten"]:
+            pdf_data_url = _document_pdf_data_url(store, project_id, document)
+        details_html = _export_candidate_summary_html(
+            payload,
+            markdown_text,
+            ranked,
+            pdf_data_url,
+        )
+        link_cells = _export_link_cells(project_id, document, static)
+        row_class = " class=\"top-ten-row\"" if ranked["top_ten"] else ""
+        row = (
+            f"<tr{row_class}>"
             "<td>"
             "<details class=\"export-details\">"
             f"<summary>{_h(_document_label(document))}</summary>"
-            f"{_export_candidate_summary_html(payload)}"
+            f"{details_html}"
             "</details>"
             "</td>"
+            f"<td>{_h(metadata.get('current_or_recent_title', ''))}</td>"
+            f"<td>{_h(metadata.get('current_or_recent_employer', ''))}</td>"
+            f"<td>{_h(metadata.get('years_of_experience_estimate', ''))}</td>"
             f"<td class=\"flag-cell\">{_canada_flag(scores)}</td>"
             f"<td>{_h(ranked['rank'])}</td>"
+            f"<td>{_h(_adjusted_rank_label(ranked))}</td>"
+            f"<td class=\"summary-cell\">{_h(_rerank_decision_summary(ranked))}</td>"
             f"<td>{_h(_score(scores.get('aggregate')))}</td>"
             f"<td>{_h(_score(scores.get('holistic')))}</td>"
             f"<td>{_h(_score(ranked['average']))}</td>"
             f"<td>{_h(ranked['recommendation'])}</td>"
-            f"<td><a href=\"{resume_href}\">Resume PDF</a></td>"
-            f"<td><a href=\"{report_href}\">Report</a></td>"
-            f"<td><a href=\"{markdown_href}\">Markdown</a></td>"
+            f"{link_cells}"
             "</tr>"
         )
-    if not rows:
-        rows.append(_empty_row(10, "No reviewed resumes."))
+        if ranked["top_ten"]:
+            top_rows.append(row)
+        else:
+            lower_rows.append(row)
+    column_count = 15 if not static else 12
+    if not top_rows and not lower_rows:
+        top_rows.append(_empty_row(column_count, "No reviewed resumes."))
+    rerank_note = _final_rerank_note(project)
+    link_headers = "" if static else "<th>Resume</th><th>Report</th><th>Markdown</th>"
+    nav = (
+        "<nav class=\"top-nav\">"
+        f"<a href=\"/projects/{quote(project_id)}\">Back to project</a>"
+        f"<a href=\"{_reviewed_export_href(project_id, download=True)}\">"
+        "Download HTML</a>"
+        "</nav>"
+        if not static
+        else ""
+    )
+    lower_body = (
+        "<tbody class=\"below-line\">"
+        f"<tr class=\"section-row\"><td colspan=\"{column_count}\">"
+        "Below top 10</td></tr>"
+        + "".join(lower_rows)
+        + "</tbody>"
+        if lower_rows
+        else ""
+    )
+    context_html = _export_context_html(project)
     body = f"""
     <div class="document-shell export-shell">
-      <nav class="top-nav">
-        <a href="/projects/{quote(project_id)}">Back to project</a>
-        <a href="{_reviewed_export_href(project_id, download=True)}">
-          Download HTML
-        </a>
-      </nav>
+      {nav}
       <article class="document-card">
         <header class="document-header">
           <span class="eyebrow">Reviewed Results Export</span>
           <h1>{_h(project.get('name', project_id))}</h1>
           <p>
-            Ranked reviewed resumes with expandable screening details and links
-            to each resume, report, and markdown extract.
+            Ranked reviewed resumes with expandable full reports and markdown
+            resume extracts. The top 10 window reflects the latest final
+            comparative rerank when available.
           </p>
         </header>
         <div class="export-body">
+          {context_html}
+          {rerank_note}
           <table class="reviewed-export-table">
             <thead>
               <tr>
-                <th>Candidate</th><th>Canada</th><th>Rank</th>
-                <th>Aggregate</th><th>Holistic</th><th>Avg</th>
-                <th>Recommendation</th><th>Resume</th><th>Report</th>
-                <th>Markdown</th>
+                <th>Candidate</th><th>Recent role</th><th>Employer</th>
+                <th>Experience</th><th>Canada</th><th>Rank</th>
+                <th>Adjusted</th><th>Final thesis</th>
+                <th>Aggregate</th><th>Holistic</th>
+                <th>Avg</th><th>Recommendation</th>{link_headers}
               </tr>
             </thead>
-            <tbody>{''.join(rows)}</tbody>
+            <tbody class="top-ten-window">
+              <tr class="section-row">
+                <td colspan="{column_count}">Top 10 final review window</td>
+              </tr>
+              {''.join(top_rows)}
+            </tbody>
+            {lower_body}
           </table>
         </div>
       </article>
     </div>
     """
     return _page(f"Reviewed Export: {project.get('name', project_id)}", body)
+
+
+def _export_link_cells(
+    project_id: str,
+    document: dict[str, Any],
+    static: bool,
+) -> str:
+    if static:
+        return ""
+    resume_href = _document_file_href(project_id, document["id"])
+    report_href = _document_view_href(project_id, document["id"], "review")
+    markdown_href = _document_view_href(project_id, document["id"], "markdown")
+    return (
+        f"<td><a href=\"{resume_href}\">Resume PDF</a></td>"
+        f"<td><a href=\"{report_href}\">Report</a></td>"
+        f"<td><a href=\"{markdown_href}\">Markdown</a></td>"
+    )
+
+
+def _final_rerank_note(project: dict[str, Any]) -> str:
+    final_rerank = project.get("final_rerank") or {}
+    payload = final_rerank.get("payload") or {}
+    created_at = _format_ts(final_rerank.get("created_at", ""))
+    if not final_rerank:
+        return (
+            "<p class=\"muted\">Final comparative rerank has not been run yet. "
+            "Adjusted rank is blank until you run it.</p>"
+        )
+    notes = str(payload.get("overall_notes") or "").strip()
+    note_html = f"<p>{_h(notes)}</p>" if notes else ""
+    return (
+        "<section class=\"final-rerank-note\">"
+        f"<strong>Final rerank completed {_h(created_at)}</strong>"
+        f"{note_html}"
+        "</section>"
+    )
+
+
+def _export_context_html(project: dict[str, Any]) -> str:
+    job_posting = str(project.get("job_posting") or "").strip()
+    work_context = str(project.get("work_context") or "").strip()
+    return f"""
+    <section class="export-context">
+      <details open>
+        <summary>Job description and screening context</summary>
+        <div class="export-context-grid">
+          <article class="export-context-card">
+            <h2>Job Description</h2>
+            <pre>{_h(job_posting or 'No job description saved.')}</pre>
+          </article>
+          <article class="export-context-card">
+            <h2>Additional Notes / Context</h2>
+            <pre>{_h(work_context or 'No additional context saved.')}</pre>
+          </article>
+        </div>
+      </details>
+    </section>
+    """
+
+
+def _document_text(
+    store: ProjectStore,
+    project_id: str,
+    document: dict[str, Any],
+    path_key: str,
+) -> str:
+    relative = document.get(path_key)
+    if not relative:
+        return ""
+    try:
+        path = store.resolve_project_path(project_id, relative)
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _document_pdf_data_url(
+    store: ProjectStore,
+    project_id: str,
+    document: dict[str, Any],
+) -> str:
+    relative = document.get("redacted_pdf_path") or document.get("pdf_path")
+    if not relative:
+        return ""
+    try:
+        path = store.resolve_project_path(project_id, relative)
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    except OSError:
+        return ""
+    return f"data:application/pdf;base64,{encoded}"
+
+
+def _final_rerank_candidate_records(
+    store: ProjectStore,
+    project_id: str,
+    ranked_documents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    records = []
+    for ranked in ranked_documents:
+        document = ranked["document"]
+        metadata = document.get("metadata") or {}
+        records.append(
+            {
+                "candidate_key": document["id"],
+                "original_rank": ranked["rank"],
+                "screening_average": ranked["average"],
+                "scores": document.get("scores") or {},
+                "metadata": {
+                    "current_or_recent_title": metadata.get(
+                        "current_or_recent_title",
+                        "",
+                    ),
+                    "current_or_recent_employer": metadata.get(
+                        "current_or_recent_employer",
+                        "",
+                    ),
+                    "years_of_experience_estimate": metadata.get(
+                        "years_of_experience_estimate",
+                        "",
+                    ),
+                },
+                "report_output": _document_text(
+                    store,
+                    project_id,
+                    document,
+                    "review_markdown_path",
+                ),
+                "markdown_output": _document_text(
+                    store,
+                    project_id,
+                    document,
+                    "markdown_path",
+                ),
+            }
+        )
+        records[-1]["report_output"] = _llm_safe_candidate_text(
+            records[-1]["report_output"],
+            document,
+        )
+        records[-1]["markdown_output"] = _llm_safe_candidate_text(
+            records[-1]["markdown_output"],
+            document,
+        )
+    return records
+
+
+def _llm_safe_candidate_text(text: str, document: dict[str, Any]) -> str:
+    safe_text = text
+    for hint in _candidate_name_hints(document):
+        safe_text = re.sub(
+            re.escape(hint),
+            "[candidate name redacted]",
+            safe_text,
+            flags=re.IGNORECASE,
+        )
+    return safe_text
 
 
 def _load_review_payload(
@@ -2002,6 +2390,7 @@ def _overlay_payload_scores(
 def _review_payload_to_html(payload: dict[str, Any]) -> str:
     return (
         _score_dashboard_html(payload)
+        + _score_rationale_html(payload)
         + _tradeoff_html(payload)
         + _education_fit_html(payload)
         + _work_experience_fit_html(payload)
@@ -2063,6 +2452,29 @@ def _tradeoff_html(payload: dict[str, Any]) -> str:
     <section class="review-section tradeoff-summary">
       <h2>Tradeoff Analysis</h2>
       <p>{_h(tradeoff)}</p>
+    </section>
+    """
+
+
+def _score_rationale_html(payload: dict[str, Any]) -> str:
+    rationale = payload.get("score_rationale") or {}
+    if not isinstance(rationale, dict):
+        return ""
+    rows = []
+    for label, key in (
+        ("Aggregate formula", "aggregate_formula"),
+        ("Holistic adjustments", "holistic_adjustments"),
+        ("Calibration notes", "calibration_notes"),
+    ):
+        value = str(rationale.get(key) or "").strip()
+        if value:
+            rows.append(f"<li><strong>{_h(label)}:</strong> {_h(value)}</li>")
+    if not rows:
+        return ""
+    return f"""
+    <section class="review-section score-rationale">
+      <h2>Score Rationale</h2>
+      <ul>{''.join(rows)}</ul>
     </section>
     """
 
@@ -2220,21 +2632,71 @@ def _prescreen_email_html(payload: dict[str, Any]) -> str:
     """
 
 
-def _export_candidate_summary_html(payload: dict[str, Any]) -> str:
+def _export_candidate_summary_html(
+    payload: dict[str, Any],
+    markdown_text: str,
+    ranked: dict[str, Any],
+    pdf_data_url: str = "",
+) -> str:
+    report_html = (
+        _review_payload_to_html(payload)
+        if payload
+        else "<p>No review payload found.</p>"
+    )
+    markdown_html = (
+        _markdown_to_html(markdown_text)
+        if markdown_text.strip()
+        else "<p>No markdown resume found.</p>"
+    )
     if not payload:
-        return (
-            "<div class=\"export-details-body\">"
-            "<p>No review payload found.</p>"
-            "</div>"
-        )
+        report_html = "<p>No review payload found.</p>"
+    pdf_html = _embedded_pdf_html(pdf_data_url)
     return (
         "<div class=\"export-details-body\">"
-        + _tradeoff_html(payload)
-        + _education_fit_html(payload)
-        + _work_experience_fit_html(payload)
-        + _project_fit_html(payload)
+        f"{_final_rerank_record_html(ranked.get('rerank_record') or {})}"
+        f"{pdf_html}"
+        "<section class=\"export-pane report-pane\">"
+        "<h2>Full Report</h2>"
+        f"{report_html}"
+        "</section>"
+        "<section class=\"export-pane markdown-pane\">"
+        "<h2>Markdown Resume</h2>"
+        f"<div class=\"markdown-body compact-markdown\">{markdown_html}</div>"
+        "</section>"
         + "</div>"
     )
+
+
+def _embedded_pdf_html(pdf_data_url: str) -> str:
+    if not pdf_data_url:
+        return ""
+    return f"""
+    <section class="export-pane pdf-pane">
+      <h2>Redacted PDF</h2>
+      <object data="{pdf_data_url}" type="application/pdf">
+        <p>Embedded PDF preview is unavailable in this browser.</p>
+      </object>
+    </section>
+    """
+
+
+def _final_rerank_record_html(record: dict[str, Any]) -> str:
+    if not record:
+        return ""
+    summary = str(record.get("decision_summary") or "").strip()
+    strengths = str(record.get("relative_strengths") or "").strip()
+    risks = str(record.get("relative_risks") or "").strip()
+    rationale = str(record.get("rationale") or "").strip()
+    return f"""
+    <section class="final-rerank-record">
+      <h2>Final Comparative Rerank</h2>
+      <p><strong>Adjusted rank:</strong> #{_h(record.get('adjusted_rank', ''))}</p>
+      <p class="decision-summary">{_h(summary)}</p>
+      <p><strong>Rationale:</strong> {_h(rationale)}</p>
+      <p><strong>Relative strengths:</strong> {_h(strengths)}</p>
+      <p><strong>Relative risks:</strong> {_h(risks)}</p>
+    </section>
+    """
 
 
 def _text_list(value: Any) -> list[str]:
@@ -2609,6 +3071,11 @@ def _status_badge(status: str) -> str:
 
 def _document_label(document: dict[str, Any]) -> str:
     candidate_id = str(document.get("candidate_id") or "").strip()
+    candidate_name = str(document.get("candidate_name_hint") or "").strip()
+    if candidate_name and candidate_id:
+        return f"{candidate_name} | Candidate {candidate_id}"
+    if candidate_name:
+        return candidate_name
     if candidate_id:
         return f"Candidate {candidate_id}"
     return f"Document {str(document.get('id', ''))[:8]}"
@@ -3008,6 +3475,9 @@ def _page(title: str, body: str) -> str:
       font-size: 12px;
     }}
     form {{ margin: 0; }}
+    .inline-action-form {{
+      display: inline;
+    }}
     label {{
       display: block;
       color: var(--muted);
@@ -3089,10 +3559,39 @@ def _page(title: str, body: str) -> str:
       letter-spacing: 0;
     }}
     tr:last-child td {{ border-bottom: 0; }}
+    .top-ten-window {{
+      border: 3px solid var(--accent);
+      border-top-width: 4px;
+      border-bottom-width: 4px;
+    }}
+    .top-ten-row td {{
+      background: #fbfffe;
+    }}
+    .section-row td {{
+      color: var(--accent-dark);
+      background: #ecfdf9;
+      border-top: 3px solid var(--accent);
+      border-bottom: 2px solid #a7e3d8;
+      font-size: 12px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }}
+    .below-line .section-row td {{
+      color: #344054;
+      background: #eef2f6;
+      border-top-color: #98a2b3;
+    }}
     .flag-cell {{
       width: 74px;
       text-align: center;
       white-space: nowrap;
+    }}
+    .summary-cell {{
+      min-width: 220px;
+      max-width: 360px;
+      color: #344054;
+      font-size: 13px;
+      line-height: 1.4;
     }}
     .canada-flag {{
       font-size: 18px;
@@ -3388,9 +3887,10 @@ def _page(title: str, body: str) -> str:
     }}
     .export-details-body {{
       display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
       gap: 14px;
       min-width: 620px;
-      max-width: 900px;
+      max-width: 1320px;
       margin-top: 12px;
       padding: 12px;
       border: 1px solid var(--line);
@@ -3399,6 +3899,87 @@ def _page(title: str, body: str) -> str:
     }}
     .export-details-body .tradeoff-summary {{
       background: #ffffff;
+    }}
+    .export-pane {{
+      min-width: 0;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+    }}
+    .export-pane h2,
+    .final-rerank-record h2 {{
+      margin: 0 0 12px;
+      font-size: 16px;
+    }}
+    .pdf-pane {{
+      grid-column: 1 / -1;
+    }}
+    .pdf-pane object {{
+      width: 100%;
+      height: min(760px, 78vh);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-soft);
+    }}
+    .final-rerank-note,
+    .final-rerank-record {{
+      padding: 12px;
+      border: 1px solid #a7e3d8;
+      border-radius: 8px;
+      background: #ecfdf9;
+    }}
+    .export-context {{
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+    }}
+    .export-context summary {{
+      cursor: pointer;
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 900;
+    }}
+    .export-context-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }}
+    .export-context-card {{
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+    }}
+    .export-context-card h2 {{
+      margin: 0 0 10px;
+      font-size: 16px;
+    }}
+    .export-context-card pre {{
+      max-height: 420px;
+      margin: 0;
+      overflow: auto;
+      white-space: pre-wrap;
+      font-family: inherit;
+      font-size: 13px;
+      line-height: 1.45;
+    }}
+    .final-rerank-record {{
+      grid-column: 1 / -1;
+    }}
+    .decision-summary {{
+      margin: 8px 0 10px;
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 800;
+      line-height: 1.4;
+    }}
+    .compact-markdown {{
+      padding: 0;
+      font-size: 14px;
     }}
     .reviewed-export-table td:first-child {{
       min-width: 260px;

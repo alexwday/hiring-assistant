@@ -72,7 +72,7 @@ def test_reviewed_table_renders_precise_scores_recommendations_and_canada_flag()
         _reviewed_doc("g", 8.0, 8.0),
     ]
 
-    html = _reviewed_table("project-1", documents)
+    html = _reviewed_table("project-1", {}, documents)
 
     assert html.count(ADVANCE_RECOMMENDATION) == 6
     assert html.count(HOLD_RECOMMENDATION) == 1
@@ -149,6 +149,20 @@ def test_reviewed_export_html_has_expandable_rows_and_links(tmp_path):
     store = ProjectStore(tmp_path / "data")
     project = {"id": "project-1", "name": "GG08 Analyst"}
     documents = [_reviewed_doc("b", 9.7, 9.7, located_in_canada=True)]
+    project["final_rerank"] = {
+        "payload": {
+            "adjusted_rankings": [
+                {
+                    "candidate_key": "b",
+                    "adjusted_rank": 1,
+                    "decision_summary": (
+                        "Best overall fit because the resume combines "
+                        "production delivery with practical analytics judgment."
+                    ),
+                }
+            ]
+        }
+    }
 
     html = _reviewed_export_html("project-1", project, documents, store)
 
@@ -158,3 +172,22 @@ def test_reviewed_export_html_has_expandable_rows_and_links(tmp_path):
     assert "/projects/project-1/documents/b/review" in html
     assert "/projects/project-1/documents/b/markdown" in html
     assert "/projects/project-1/exports/reviewed?download=1" in html
+    assert "Final thesis" in html
+    assert "Best overall fit because" in html
+
+
+def test_static_reviewed_export_embeds_top_ten_redacted_pdf(tmp_path):
+    """It embeds redacted PDFs for top-10 candidates in the static export."""
+    store = ProjectStore(tmp_path / "data")
+    project = {"id": "project-1", "name": "GG08 Analyst"}
+    pdf_path = store.project_dir("project-1") / "documents" / "b-redacted.pdf"
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path.write_bytes(b"%PDF-1.4\n% test redacted pdf\n")
+    document = _reviewed_doc("b", 9.7, 9.7, located_in_canada=True)
+    document["redacted_pdf_path"] = "documents/b-redacted.pdf"
+
+    html = _reviewed_export_html("project-1", project, [document], store, static=True)
+
+    assert "data:application/pdf;base64," in html
+    assert "pdf-pane" in html
+    assert "/projects/" not in html

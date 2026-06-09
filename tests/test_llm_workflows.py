@@ -23,8 +23,8 @@ def test_remove_pii_metadata_strips_candidate_name_and_contact_fields():
     assert cleaned == {"current_or_recent_title": "Workflow Analyst"}
 
 
-def test_review_payload_normalizes_decimal_scores_and_canada_flag():
-    """It keeps one-decimal scoring and boolean-only Canada location signals."""
+def test_review_payload_normalizes_formula_scores_and_canada_flag():
+    """It keeps formula scoring and boolean-only Canada location signals."""
     payload = _normalize_review_payload(
         {
             "education_score": "9.74",
@@ -40,11 +40,35 @@ def test_review_payload_normalizes_decimal_scores_and_canada_flag():
     assert payload["education_score"] == 9.7
     assert payload["experience_score"] == 8.0
     assert payload["projects_score"] == 7.3
-    assert payload["aggregate_score"] == 9.7
+    assert payload["aggregate_score"] == 8.2
     assert payload["holistic_score"] == 9.0
-    assert payload["screening_average"] == 9.4
+    assert payload["screening_average"] == 8.6
     assert payload["located_in_canada"] is True
     assert payload["relevant_projects"][0]["score"] == 8.9
+    assert payload["score_rationale"]["aggregate_formula"] == (
+        "Computed by app as 25% education (9.7/10) + 45% experience "
+        "(8.0/10) + 30% projects (7.3/10) = 8.2/10."
+    )
+
+
+def test_review_payload_bounds_holistic_adjustments():
+    """It keeps holistic adjustments within the configured scoring range."""
+    payload = _normalize_review_payload(
+        {
+            "education_score": 6,
+            "experience_score": 6,
+            "projects_score": 6,
+            "aggregate_score": 6,
+            "holistic_score": 10,
+        }
+    )
+
+    assert payload["aggregate_score"] == 6.0
+    assert payload["holistic_score"] == 7.5
+    assert payload["screening_average"] == 6.8
+    assert "bounded holistic_score" in (
+        payload["score_rationale"]["calibration_notes"]
+    )
 
 
 def test_review_markdown_renders_one_decimal_scores():
@@ -58,6 +82,11 @@ def test_review_markdown_renders_one_decimal_scores():
             "holistic_score": 9,
             "screening_average": 9.35,
             "located_in_canada": True,
+            "score_rationale": {
+                "aggregate_formula": "0.25*9.0 + 0.45*8.4 + 0.30*8.0.",
+                "holistic_adjustments": "Raised for production delivery.",
+                "calibration_notes": "Needs more detail on LLM validation.",
+            },
             "tradeoff_analysis": "Strong execution, lighter formal credentials.",
             "education_entries": [
                 {
@@ -80,6 +109,9 @@ def test_review_markdown_renders_one_decimal_scores():
     assert "- Relevant projects: 8.0/10" in markdown
     assert "- Screening average: 9.4/10" in markdown
     assert "- Located in Canada: Yes" in markdown
+    assert "## Score Rationale" in markdown
+    assert "Aggregate formula" in markdown
+    assert "Raised for production delivery" in markdown
     assert (
         "### Example University | Bachelor graduated | "
         "Information Systems | GPA: 3.8"
