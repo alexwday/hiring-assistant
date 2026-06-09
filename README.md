@@ -31,7 +31,7 @@ The browser opens automatically unless `APP_OPEN_BROWSER=false` is set or
 2. Paste the job posting and optional work/context notes.
 3. Upload one or many PDF resumes.
 4. Send uploaded resumes through local PII review.
-5. Finalize redactions so only redacted page images are sent to the LLM.
+5. Finalize redactions manually, or auto-redact all locally detected PII.
 6. Process redacted resumes into LLM-readable markdown with non-contact metadata.
 7. Select processed resumes for job-fit review.
 8. Review the generated hiring-manager report and prescreen email template.
@@ -42,7 +42,9 @@ only in one table at a time:
 - `uploaded`: PDF is stored locally but has not been reviewed for PII.
 - `pii_review`: local PII boxes are ready for human review.
 - `redacted`: a finalized redacted PDF exists and is ready for LLM processing.
+- `processing`: redacted pages are being processed by the vision model.
 - `processed`: resume markdown and candidate metadata exist.
+- `reviewing`: a job-fit report is being generated.
 - `reviewed`: job-fit report and scores exist.
 
 ## Local Storage
@@ -72,18 +74,35 @@ outputs.
 
 The app does not send the uploaded original PDF to the external LLM. Processing
 first renders the PDF locally and runs local PyMuPDF/PyMuPDF4LLM-based text box
-detection for likely contact PII:
+detection for the redacted PII categories:
 
+- candidate names
 - email addresses
 - phone numbers
-- LinkedIn/profile URLs and personal links
-- postal/ZIP codes
-- address or location lines
+- web/profile URLs and personal links
 
-The PII review page lets a human finalize detected boxes and draw additional
-manual boxes. After finalization, the app saves a redacted PDF, deletes the
-original uploaded PDF for that document, and sends only redacted page images to
-the vision model. Candidate name is retained.
+The app intentionally does not auto-redact street addresses, city/location text,
+or postal codes. The PII review page lets a human finalize detected boxes and
+draw additional manual boxes. The project table also has an `Auto-redact
+selected` action that applies every local detection without opening the review
+page. After finalization, the app saves a redacted PDF, deletes the original
+uploaded PDF for that document, and sends only redacted page images to the
+vision model.
+
+## Reset Local Data
+
+All runtime data can be cleared from the UI with `Reset local data`, or on
+startup:
+
+```bash
+python main.py --reset-data
+```
+
+The same behavior can be enabled through `.env`:
+
+```bash
+APP_RESET_DATA_ON_STARTUP=true
+```
 
 ## LLM Configuration
 

@@ -130,11 +130,11 @@ class ResumeLLMService:
                 "role": "system",
                 "content": (
                     "You convert resume PDF page images into clean markdown for "
-                    "downstream LLM ingestion. Preserve factual content, names, "
+                    "downstream LLM ingestion. Preserve factual content, "
                     "dates, employers, education, skills, projects, publications, "
                     "and certifications. Normalize layout into readable headings "
                     "and bullet lists. Do not infer missing facts or recreate "
-                    "redacted contact details. "
+                    "redacted names or contact details. "
                     "Return only markdown for this page."
                 ),
             },
@@ -185,7 +185,6 @@ class ResumeLLMService:
                 "content": (
                     "Return JSON with this schema:\n"
                     "{\n"
-                    '  "candidate_name": "",\n'
                     '  "current_or_recent_title": "",\n'
                     '  "current_or_recent_employer": "",\n'
                     '  "education_highlights": [],\n'
@@ -237,7 +236,6 @@ class ResumeLLMService:
                     "exceptional match.\n\n"
                     "Required JSON schema:\n"
                     "{\n"
-                    '  "candidate_name": "",\n'
                     '  "education_summary": "",\n'
                     '  "education_score": 0,\n'
                     '  "experience_summary": "",\n'
@@ -284,8 +282,7 @@ class ResumeLLMService:
         )
         text = extract_message_text(response)
         payload = parse_json_object(text)
-        payload.setdefault("candidate_name", metadata.get("candidate_name", ""))
-        return payload
+        return _remove_pii_metadata(payload)
 
     def _combine_page_markdown(
         self,
@@ -318,9 +315,8 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 def render_review_markdown(payload: dict[str, Any]) -> str:
     """Render a structured review payload into markdown."""
-    candidate_name = payload.get("candidate_name") or "Candidate"
     lines = [
-        f"# Candidate Review: {candidate_name}",
+        "# Candidate Review",
         "",
         "## Scores",
         f"- Education: {_score(payload.get('education_score'))}/10",
@@ -416,6 +412,8 @@ def _remove_pii_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         "portfolio_or_github",
         "postal_code",
         "website",
+        "candidate_name",
+        "name",
     }
     return {key: value for key, value in payload.items() if key not in pii_keys}
 

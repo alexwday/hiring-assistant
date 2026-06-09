@@ -13,37 +13,23 @@ EMAIL_RE = re.compile(r"[\w.\-+]+@[\w.\-]+\.\w+", re.IGNORECASE)
 PHONE_RE = re.compile(
     r"(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}"
 )
-CANADIAN_POSTAL_RE = re.compile(
-    r"\b[ABCEGHJ-NPRSTVXY]\d[ABCEGHJ-NPRSTV-Z][ -]?\d[ABCEGHJ-NPRSTV-Z]\d\b",
-    re.IGNORECASE,
-)
-US_ZIP_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
 URL_RE = re.compile(
     r"(?:https?://)?(?:www\.)?(?:linkedin\.com|github\.com|gitlab\.com|"
     r"bitbucket\.org|[\w.-]+\.(?:com|ca|io|dev|me|net|org))/[^\s)]+",
     re.IGNORECASE,
 )
-STREET_RE = re.compile(
-    r"\b\d{1,6}\s+[\w .'-]+"
-    r"\b(?:street|st\.?|avenue|ave\.?|road|rd\.?|drive|dr\.?|lane|ln\.?|"
-    r"boulevard|blvd\.?|court|ct\.?|crescent|cres\.?|way|place|pl\.?)\b",
-    re.IGNORECASE,
-)
-REGION_RE = re.compile(
-    r"\b[A-Z][a-z]+(?: [A-Z][a-z]+)*,\s*"
-    r"(?:AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT|"
-    r"AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|IA|ID|IL|IN|KS|KY|LA|MA|MD|ME|"
-    r"MI|MN|MO|MS|MT|NC|ND|NE|NH|NJ|NM|NV|NY|OH|OK|OR|PA|RI|SC|SD|TN|"
-    r"TX|UT|VA|VT|WA|WI|WV|WY)\b"
-)
 
 
-def detect_pii_boxes(pdf_path: Path) -> dict[str, Any]:
+def detect_pii_boxes(
+    pdf_path: Path,
+    candidate_names: list[str] | None = None,
+) -> dict[str, Any]:
     """Detect likely PII boxes in a PDF without sending data externally."""
     document = fitz.open(pdf_path)
     try:
         pages = []
         detections = []
+        normalized_names = _normalized_candidate_names(candidate_names or [])
         for page_index, page in enumerate(document):
             rect = page.rect
             page_info = {
@@ -52,7 +38,14 @@ def detect_pii_boxes(pdf_path: Path) -> dict[str, Any]:
                 "height": rect.height,
             }
             pages.append(page_info)
-            detections.extend(_detect_page_pii(page, page_info))
+            detections.extend(
+                _detect_page_pii(
+                    page=page,
+                    page_info=page_info,
+                    candidate_names=normalized_names,
+                    page_index=page_index,
+                )
+            )
         return {"pages": pages, "detections": detections}
     finally:
         document.close()
@@ -103,6 +96,8 @@ def delete_paths(paths: list[Path]) -> None:
 def _detect_page_pii(
     page: fitz.Page,
     page_info: dict[str, Any],
+    candidate_names: list[str],
+    page_index: int,
 ) -> list[dict[str, Any]]:
     words = page.get_text("words", sort=True)
     line_map: dict[tuple[int, int], list[tuple[Any, ...]]] = {}
@@ -115,48 +110,111 @@ def _detect_page_pii(
         line_words = sorted(line_words, key=lambda item: item[7])
         line_text = " ".join(str(word[4]) for word in line_words)
         line_box = _bbox_for_words(line_words)
-        line_is_contact = _line_has_contact_pii(line_text)
-        line_is_address = _line_has_address_pii(line_text, line_number)
-        if line_is_contact or line_is_address:
-            label = "Contact line" if line_is_contact else "Address or location"
-            detections.append(_detection(page_info, line_box, label, "line"))
+        if _line_matches_candidate_name(line_text, candidate_names) or (
+            page_index == 0 and line_number == 0 and _line_looks_like_name(line_text)
+        ):
+            detections.append(_detection(page_info, line_box, "Candidate name", "line"))
             continue
-
-        for word in line_words:
-            word_text = str(word[4])
-            label = _word_pii_label(word_text)
-            if label:
-                detections.append(_detection(page_info, word[:4], label, "word"))
+        detections.extend(_detect_line_contact_items(line_words, page_info))
     return _dedupe_detections(detections)
 
 
-def _line_has_contact_pii(text: str) -> bool:
-    lowered = text.lower()
-    return bool(
-        EMAIL_RE.search(text)
-        or PHONE_RE.search(text)
-        or URL_RE.search(text)
-        or "linkedin" in lowered
-    )
+def _normalized_candidate_names(values: list[str]) -> list[str]:
+    names = []
+    for value in values:
+        normalized = _normalize_name(value)
+        if normalized and " " in normalized:
+            names.append(normalized)
+    return names
 
 
-def _line_has_address_pii(text: str, line_number: int) -> bool:
-    if CANADIAN_POSTAL_RE.search(text) or STREET_RE.search(text):
-        return True
-    if line_number <= 12 and REGION_RE.search(text):
-        return True
-    return bool(line_number <= 12 and US_ZIP_RE.search(text))
+def _line_matches_candidate_name(text: str, candidate_names: list[str]) -> bool:
+    normalized = _normalize_name(text)
+    return any(name in normalized for name in candidate_names)
 
 
-def _word_pii_label(text: str) -> str:
-    lowered = text.lower()
-    if EMAIL_RE.search(text):
-        return "Email"
-    if URL_RE.search(text) or "linkedin" in lowered:
-        return "Profile URL"
-    if CANADIAN_POSTAL_RE.search(text) or US_ZIP_RE.search(text):
-        return "Postal code"
-    return ""
+def _line_looks_like_name(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", text.strip())
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "@",
+            "address",
+            "candidate",
+            "curriculum",
+            "email",
+            "linkedin",
+            "phone",
+            "resume",
+            "résumé",
+            "summary",
+            "www.",
+        )
+    ):
+        return False
+    tokens = [token.strip(".,:;()[]{}") for token in cleaned.split()]
+    if not 2 <= len(tokens) <= 5:
+        return False
+    alpha_tokens = [
+        token
+        for token in tokens
+        if re.fullmatch(r"[A-Za-z][A-Za-z'-]+", token)
+    ]
+    return len(alpha_tokens) == len(tokens)
+
+
+def _normalize_name(value: str) -> str:
+    return re.sub(r"[^a-z]+", " ", value.lower()).strip()
+
+
+def _detect_line_contact_items(
+    words: list[tuple[Any, ...]],
+    page_info: dict[str, Any],
+) -> list[dict[str, Any]]:
+    line_text, spans = _line_text_with_spans(words)
+    detections = []
+    for label, pattern in (
+        ("Email", EMAIL_RE),
+        ("Phone", PHONE_RE),
+        ("Web address", URL_RE),
+    ):
+        for match in pattern.finditer(line_text):
+            matched_words = [
+                word
+                for word, start, end in spans
+                if start < match.end() and end > match.start()
+            ]
+            if matched_words:
+                detections.append(
+                    _detection(
+                        page_info,
+                        _bbox_for_words(matched_words),
+                        label,
+                        "regex",
+                    )
+                )
+    return detections
+
+
+def _line_text_with_spans(
+    words: list[tuple[Any, ...]],
+) -> tuple[str, list[tuple[tuple[Any, ...], int, int]]]:
+    parts = []
+    spans = []
+    cursor = 0
+    for word in words:
+        if parts:
+            parts.append(" ")
+            cursor += 1
+        text = str(word[4])
+        start = cursor
+        parts.append(text)
+        cursor += len(text)
+        spans.append((word, start, cursor))
+    return "".join(parts), spans
 
 
 def _bbox_for_words(words: list[tuple[Any, ...]]) -> tuple[float, float, float, float]:

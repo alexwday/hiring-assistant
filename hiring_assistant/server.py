@@ -13,7 +13,7 @@ import webbrowser
 from email import policy
 from email.parser import BytesParser
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
@@ -37,7 +37,7 @@ from utilities.ssl_setup import SSLSetupResult, setup_ssl
 logger = logging.getLogger(__name__)
 
 
-class HiringAssistantHTTPServer(HTTPServer):
+class HiringAssistantHTTPServer(ThreadingHTTPServer):
     """HTTP server carrying shared application dependencies."""
 
     def __init__(
@@ -136,6 +136,9 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         segments = _path_segments(parsed.path)
 
         try:
+            if len(segments) == 1 and segments[0] == "reset":
+                self._reset_local_data()
+                return
             if len(segments) == 1 and segments[0] == "projects":
                 self._create_project()
                 return
@@ -153,6 +156,9 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                     return
                 if action == "process":
                     self._process_resumes(project_id)
+                    return
+                if action == "auto-redact":
+                    self._auto_redact_resumes(project_id)
                     return
                 if action == "review":
                     self._review_resumes(project_id)
@@ -235,6 +241,7 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                 Choose or create a project before adding a job posting and
                 context notes.
               </p>
+              {_reset_form()}
             </aside>
           </div>
         </div>
@@ -247,10 +254,20 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         uploaded = [
             doc
             for doc in documents
-            if doc.get("status") in {"uploaded", "pii_review", "redacted"}
+            if doc.get("status")
+            in {"uploaded", "pii_review", "redacted", "processing"}
         ]
-        processed = [doc for doc in documents if doc.get("status") == "processed"]
+        processed = [
+            doc
+            for doc in documents
+            if doc.get("status") in {"processed", "reviewing"}
+        ]
         reviewed = [doc for doc in documents if doc.get("status") == "reviewed"]
+        active_count = sum(
+            1
+            for doc in documents
+            if doc.get("status") in {"processing", "reviewing"}
+        )
         projects = self.server.store.list_projects()
         stats = (
             _stat("Unprocessed", len(uploaded))
@@ -334,9 +351,11 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                   processed, or reviewed.
                 </p>
               </div>
+              {_reset_form()}
             </aside>
           </div>
         </div>
+        {_auto_refresh_script(active_count)}
         """
         return _page(project["name"], body)
 
@@ -644,6 +663,10 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             + urlencode({"message": "Project created"})
         )
 
+    def _reset_local_data(self) -> None:
+        self.server.store.reset_all()
+        self._redirect("/?message=Local%20project%20data%20deleted")
+
     def _upload_resumes(self, project_id: str) -> None:
         _form, files = self._parse_post()
         created = self.server.store.add_uploads(project_id, files)
@@ -716,11 +739,12 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             self._redirect_project(project_id, "Select at least one resume", "error")
             return
 
-        service = ResumeLLMService(self.server.config, self.server.ssl_setup)
         screened_count = 0
-        processed_count = 0
+        processing_count = 0
         pending_count = 0
         failed_count = 0
+        pii_review_ids = []
+        processing_ids = []
         for document_id in document_ids:
             try:
                 project = self.server.store.load_project(project_id)
@@ -729,10 +753,21 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                 if status == "uploaded":
                     self._screen_one_resume(project_id, document_id)
                     screened_count += 1
+                    pii_review_ids.append(document_id)
                 elif status == "redacted":
-                    self._process_one_resume(project_id, document_id, service)
-                    processed_count += 1
+                    self.server.store.update_document(
+                        project_id,
+                        document_id,
+                        status="processing",
+                        processing_started_at=utc_now(),
+                        processing_error="",
+                    )
+                    processing_ids.append(document_id)
+                    processing_count += 1
                 elif status == "pii_review":
+                    pending_count += 1
+                    pii_review_ids.append(document_id)
+                elif status == "processing":
                     pending_count += 1
                 else:
                     raise ValueError(
@@ -746,16 +781,76 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                     document_id,
                     processing_error=str(exc),
                 )
-        level = "error" if failed_count and not processed_count else "info"
-        if screened_count == 1 and not processed_count and not failed_count:
+        if processing_ids:
+            threading.Thread(
+                target=self._process_resume_batch,
+                args=(project_id, processing_ids),
+                daemon=True,
+            ).start()
+
+        level = "error" if failed_count and not processing_count else "info"
+        if (
+            len(pii_review_ids) == 1
+            and not processing_count
+            and not failed_count
+        ):
             self._redirect(
                 f"/projects/{quote(project_id)}/documents/"
-                f"{quote(document_ids[0])}/pii"
+                f"{quote(pii_review_ids[0])}/pii"
             )
             return
         message = (
-            f"PII review {screened_count}; processed {processed_count}; "
+            f"PII review {screened_count}; processing {processing_count}; "
             f"pending {pending_count}; failed {failed_count}"
+        )
+        self._redirect_project(project_id, message, level)
+
+    def _auto_redact_resumes(self, project_id: str) -> None:
+        form, _files = self._parse_post()
+        document_ids = form.get("document_id", [])
+        if not document_ids:
+            self._redirect_project(project_id, "Select at least one resume", "error")
+            return
+
+        redacted_count = 0
+        skipped_count = 0
+        failed_count = 0
+        for document_id in document_ids:
+            try:
+                project = self.server.store.load_project(project_id)
+                document = self.server.store.get_document(project, document_id)
+                status = document.get("status")
+                if status == "uploaded":
+                    self._screen_one_resume(project_id, document_id)
+                    project = self.server.store.load_project(project_id)
+                    document = self.server.store.get_document(project, document_id)
+                    status = document.get("status")
+                if status == "pii_review":
+                    self._apply_document_redactions(
+                        project_id=project_id,
+                        document_id=document_id,
+                        redactions=document.get("pii_detections") or [],
+                    )
+                    redacted_count += 1
+                elif status == "redacted":
+                    skipped_count += 1
+                else:
+                    raise ValueError(
+                        "Only uploaded or PII-review resumes can auto-redact"
+                    )
+            except Exception as exc:
+                failed_count += 1
+                logger.exception("Auto-redaction failed: %s", document_id)
+                self.server.store.update_document(
+                    project_id,
+                    document_id,
+                    pii_error=str(exc),
+                )
+
+        level = "error" if failed_count and not redacted_count else "info"
+        message = (
+            f"Auto-redacted {redacted_count}; skipped {skipped_count}; "
+            f"failed {failed_count}"
         )
         self._redirect_project(project_id, message, level)
 
@@ -778,13 +873,26 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             )
             return
 
-        service = ResumeLLMService(self.server.config, self.server.ssl_setup)
-        reviewed_count = 0
+        reviewing_count = 0
         failed_count = 0
+        reviewing_ids = []
         for document_id in document_ids:
             try:
-                self._review_one_resume(project_id, document_id, service)
-                reviewed_count += 1
+                document = self.server.store.get_document(
+                    self.server.store.load_project(project_id),
+                    document_id,
+                )
+                if document.get("status") != "processed":
+                    raise ValueError("Only processed resumes can be reviewed")
+                self.server.store.update_document(
+                    project_id,
+                    document_id,
+                    status="reviewing",
+                    review_started_at=utc_now(),
+                    review_error="",
+                )
+                reviewing_ids.append(document_id)
+                reviewing_count += 1
             except Exception as exc:
                 failed_count += 1
                 logger.exception("Resume review failed: %s", document_id)
@@ -793,8 +901,14 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                     document_id,
                     review_error=str(exc),
                 )
-        level = "error" if failed_count and not reviewed_count else "info"
-        message = f"Reviewed {reviewed_count}; failed {failed_count}"
+        if reviewing_ids:
+            threading.Thread(
+                target=self._review_resume_batch,
+                args=(project_id, reviewing_ids),
+                daemon=True,
+            ).start()
+        level = "error" if failed_count and not reviewing_count else "info"
+        message = f"Reviewing {reviewing_count}; failed {failed_count}"
         self._redirect_project(project_id, message, level)
 
     def _split_package(self, project_id: str, package_id: str) -> None:
@@ -875,6 +989,42 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                 + urlencode({"message": str(exc), "level": "error"})
             )
 
+    def _process_resume_batch(
+        self,
+        project_id: str,
+        document_ids: list[str],
+    ) -> None:
+        service = ResumeLLMService(self.server.config, self.server.ssl_setup)
+        for document_id in document_ids:
+            try:
+                self._process_one_resume(project_id, document_id, service)
+            except Exception as exc:
+                logger.exception("Background resume processing failed: %s", document_id)
+                self.server.store.update_document(
+                    project_id,
+                    document_id,
+                    status="redacted",
+                    processing_error=str(exc),
+                )
+
+    def _review_resume_batch(
+        self,
+        project_id: str,
+        document_ids: list[str],
+    ) -> None:
+        service = ResumeLLMService(self.server.config, self.server.ssl_setup)
+        for document_id in document_ids:
+            try:
+                self._review_one_resume(project_id, document_id, service)
+            except Exception as exc:
+                logger.exception("Background resume review failed: %s", document_id)
+                self.server.store.update_document(
+                    project_id,
+                    document_id,
+                    status="processed",
+                    review_error=str(exc),
+                )
+
     def _screen_one_resume(self, project_id: str, document_id: str) -> None:
         project = self.server.store.load_project(project_id)
         document = self.server.store.get_document(project, document_id)
@@ -895,7 +1045,10 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             / document_id
         )
         page_paths = render_pdf_pages(pdf_path=pdf_path, output_dir=pages_dir)
-        pii_result = detect_pii_boxes(pdf_path)
+        pii_result = detect_pii_boxes(
+            pdf_path,
+            candidate_names=_candidate_name_hints(document),
+        )
         self.server.store.update_document(
             project_id,
             document_id,
@@ -925,6 +1078,19 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         if not selection_dirty and len(redactions) < len(detections):
             redactions = detections
 
+        self._apply_document_redactions(
+            project_id=project_id,
+            document_id=document_id,
+            redactions=redactions,
+        )
+        self._redirect_project(project_id, "Redactions finalized")
+
+    def _apply_document_redactions(
+        self,
+        project_id: str,
+        document_id: str,
+        redactions: list[dict[str, Any]],
+    ) -> None:
         project = self.server.store.load_project(project_id)
         document = self.server.store.get_document(project, document_id)
         if document.get("status") != "pii_review":
@@ -981,10 +1147,12 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             pii_page_image_paths=[],
             redactions=_sanitize_redactions(redactions),
             original_pdf_deleted=True,
+            original_filename=_privacy_filename(document),
+            stored_filename=f"{document_id}.pdf",
+            candidate_name_hint="",
             pii_error="",
             processing_error="",
         )
-        self._redirect_project(project_id, "Redactions finalized")
 
     def _process_one_resume(
         self,
@@ -994,8 +1162,8 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
     ) -> None:
         project = self.server.store.load_project(project_id)
         document = self.server.store.get_document(project, document_id)
-        if document.get("status") != "redacted":
-            raise ValueError("Only redacted resumes can be sent to the LLM")
+        if document.get("status") != "processing":
+            raise ValueError("Only processing resumes can be sent to the LLM")
 
         project_root = self.server.store.project_dir(project_id)
         page_paths = [
@@ -1022,7 +1190,7 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         upload_date = document.get("upload_date") or "unknown-date"
         result = service.process_resume_pages(
             page_paths=page_paths,
-            original_filename=document.get("original_filename", "resume.pdf"),
+            original_filename=_privacy_filename(document),
         )
 
         markdown_rel = f"documents/{upload_date}/processed/{document_id}.md"
@@ -1052,8 +1220,8 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
     ) -> None:
         project = self.server.store.load_project(project_id)
         document = self.server.store.get_document(project, document_id)
-        if document.get("status") != "processed":
-            raise ValueError("Only processed resumes can be reviewed")
+        if document.get("status") != "reviewing":
+            raise ValueError("Only reviewing resumes can be reviewed")
 
         markdown_path = self.server.store.resolve_project_path(
             project_id,
@@ -1144,6 +1312,7 @@ def run_server(
     env_path: str = ".env",
     data_dir: str = "data",
     open_browser: bool = True,
+    reset_data: bool = False,
 ) -> None:
     """Start the local hiring assistant web server."""
     config = load_config(env_path)
@@ -1153,6 +1322,8 @@ def run_server(
         raise RuntimeError(ssl_setup.error or "SSL setup failed")
 
     store = ProjectStore(data_dir)
+    if reset_data:
+        store.reset_all()
     store.ensure_ready()
     server = HiringAssistantHTTPServer(
         (host, port),
@@ -1182,6 +1353,7 @@ def main() -> int:
     parser.add_argument("--env", default=".env")
     parser.add_argument("--data-dir", default="")
     parser.add_argument("--no-open-browser", action="store_true")
+    parser.add_argument("--reset-data", action="store_true")
     args = parser.parse_args()
     env_path = Path(args.env)
     if env_path.exists():
@@ -1193,6 +1365,8 @@ def main() -> int:
         env_path=args.env,
         data_dir=args.data_dir or os.getenv("APP_DATA_DIR", "data"),
         open_browser=open_browser,
+        reset_data=args.reset_data
+        or _truthy_env("APP_RESET_DATA_ON_STARTUP", False),
     )
     return 0
 
@@ -1242,6 +1416,18 @@ def _banner(
         {actions}
       </div>
     </header>
+    """
+
+
+def _reset_form() -> str:
+    confirm_text = (
+        "Delete all local projects, packages, resumes, and reviews?"
+    )
+    return f"""
+    <form method="post" action="/reset" class="reset-form"
+          onsubmit="return confirm('{_h(confirm_text)}');">
+      <button type="submit" class="danger-button">Reset local data</button>
+    </form>
     """
 
 
@@ -1449,11 +1635,13 @@ def _uploaded_table(project_id: str, documents: list[dict[str, Any]]) -> str:
         status = document.get("status", "uploaded")
         checkbox = (
             _checkbox(document["id"])
-            if status in {"uploaded", "redacted"}
+            if status in {"uploaded", "pii_review", "redacted"}
             else ""
         )
         pii_href = _document_view_href(project_id, document["id"], "pii")
         if status == "redacted":
+            pii_action = "Finalized"
+        elif status == "processing":
             pii_action = "Finalized"
         else:
             pii_action = f"<a href=\"{pii_href}\">PII review</a>"
@@ -1461,7 +1649,7 @@ def _uploaded_table(project_id: str, documents: list[dict[str, Any]]) -> str:
             "<tr>"
             f"<td>{checkbox}</td>"
             f"<td>{_file_link(project_id, document)}</td>"
-            f"<td>{_h(_status_label(status))}</td>"
+            f"<td>{_status_badge(status)}</td>"
             f"<td>{pii_action}</td>"
             f"<td>{_h(_format_ts(document.get('uploaded_at', '')))}</td>"
             f"<td class=\"error-cell\">{_h(error)}</td>"
@@ -1470,21 +1658,29 @@ def _uploaded_table(project_id: str, documents: list[dict[str, Any]]) -> str:
     if not rows:
         rows.append(_empty_row(6, "No unprocessed resumes."))
     selectable = [
-        doc for doc in documents if doc.get("status") in {"uploaded", "redacted"}
+        doc
+        for doc in documents
+        if doc.get("status") in {"uploaded", "pii_review", "redacted"}
     ]
     disabled = " disabled" if not selectable else ""
     return f"""
-    <form method="post" action="/projects/{quote(project_id)}/process">
+    <form method="post" action="/projects/{quote(project_id)}/process"
+          class="selection-form">
       <table>
         <thead>
           <tr>
-            <th></th><th>File</th><th>Status</th><th>PII</th>
+            <th>{_select_all_checkbox()}</th><th>File</th><th>Status</th><th>PII</th>
             <th>Uploaded</th><th>Error</th>
           </tr>
         </thead>
         <tbody>{''.join(rows)}</tbody>
       </table>
       <div class="table-action">
+        {_selection_buttons()}
+        <button type="submit"{disabled}
+                formaction="/projects/{quote(project_id)}/auto-redact">
+          Auto-redact selected
+        </button>
         <button type="submit"{disabled}>Continue selected</button>
       </div>
     </form>
@@ -1496,12 +1692,14 @@ def _processed_table(project_id: str, documents: list[dict[str, Any]]) -> str:
     for document in documents:
         metadata = document.get("metadata") or {}
         error = document.get("review_error", "")
-        checkbox = _checkbox(document["id"])
+        status = document.get("status", "processed")
+        checkbox = _checkbox(document["id"]) if status == "processed" else ""
         markdown_href = _document_view_href(project_id, document["id"], "markdown")
         rows.append(
             "<tr>"
             f"<td>{checkbox}</td>"
             f"<td>{_candidate_label(project_id, document)}</td>"
+            f"<td>{_status_badge(status)}</td>"
             f"<td>{_h(metadata.get('current_or_recent_title', ''))}</td>"
             f"<td>{_h(metadata.get('current_or_recent_employer', ''))}</td>"
             f"<td>{_h(metadata.get('years_of_experience_estimate', ''))}</td>"
@@ -1510,20 +1708,24 @@ def _processed_table(project_id: str, documents: list[dict[str, Any]]) -> str:
             "</tr>"
         )
     if not rows:
-        rows.append(_empty_row(7, "No processed resumes."))
-    disabled = " disabled" if not documents else ""
+        rows.append(_empty_row(8, "No processed resumes."))
+    selectable = [doc for doc in documents if doc.get("status") == "processed"]
+    disabled = " disabled" if not selectable else ""
     return f"""
-    <form method="post" action="/projects/{quote(project_id)}/review">
+    <form method="post" action="/projects/{quote(project_id)}/review"
+          class="selection-form">
       <table>
         <thead>
           <tr>
-            <th></th><th>Candidate</th><th>Recent role</th><th>Employer</th>
-            <th>Experience</th><th>LLM Markdown</th><th>Error</th>
+            <th>{_select_all_checkbox()}</th><th>Candidate</th><th>Status</th>
+            <th>Recent role</th><th>Employer</th><th>Experience</th>
+            <th>LLM Markdown</th><th>Error</th>
           </tr>
         </thead>
         <tbody>{''.join(rows)}</tbody>
       </table>
       <div class="table-action">
+        {_selection_buttons()}
         <button type="submit"{disabled}>Review selected</button>
       </div>
     </form>
@@ -1677,6 +1879,59 @@ def _redaction_script() -> str:
     """
 
 
+def _auto_refresh_script(active_count: int) -> str:
+    if active_count <= 0:
+        return ""
+    return """
+    <script>
+      window.setTimeout(() => {
+        window.location.reload();
+      }, 5000);
+    </script>
+    """
+
+
+def _interaction_script() -> str:
+    return """
+    <script>
+      (() => {
+        document.addEventListener("click", event => {
+          const button = event.target.closest("[data-select-action]");
+          if (!button) return;
+          const form = button.closest("form");
+          if (!form) return;
+          const checked = button.dataset.selectAction === "all";
+          form.querySelectorAll("input[name='document_id']").forEach(input => {
+            input.checked = checked;
+          });
+          const master = form.querySelector("[data-select-master]");
+          if (master) master.checked = checked;
+        });
+
+        document.addEventListener("change", event => {
+          const master = event.target.closest("[data-select-master]");
+          if (!master) return;
+          const form = master.closest("form");
+          if (!form) return;
+          form.querySelectorAll("input[name='document_id']").forEach(input => {
+            input.checked = master.checked;
+          });
+        });
+
+        document.addEventListener("submit", event => {
+          const form = event.target.closest("form.selection-form");
+          if (!form) return;
+          const submit = event.submitter || form.querySelector("button[type='submit']");
+          if (submit) {
+            submit.disabled = true;
+            submit.textContent = "Working...";
+          }
+        });
+      })();
+    </script>
+    """
+
+
 def _sanitize_redactions(redactions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     sanitized = []
     for redaction in redactions:
@@ -1698,18 +1953,16 @@ def _sanitize_redactions(redactions: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def _candidate_label(project_id: str, document: dict[str, Any]) -> str:
-    metadata = document.get("metadata") or {}
-    name = metadata.get("candidate_name") or document.get("original_filename", "Resume")
     return (
         f"<a href=\"/projects/{quote(project_id)}/files/{quote(document['id'])}\">"
-        f"{_h(name)}</a>"
+        f"{_h(_document_label(document))}</a>"
     )
 
 
 def _file_link(project_id: str, document: dict[str, Any]) -> str:
     return (
         f"<a href=\"/projects/{quote(project_id)}/files/{quote(document['id'])}\">"
-        f"{_h(document.get('original_filename', 'resume.pdf'))}</a>"
+        f"{_h(_document_label(document))}</a>"
     )
 
 
@@ -1718,6 +1971,46 @@ def _checkbox(document_id: str) -> str:
         "<input type=\"checkbox\" name=\"document_id\" "
         f"value=\"{_h(document_id)}\">"
     )
+
+
+def _select_all_checkbox() -> str:
+    return "<input type=\"checkbox\" data-select-master aria-label=\"Select all\">"
+
+
+def _selection_buttons() -> str:
+    return """
+    <button type="button" class="secondary-button compact-button"
+            data-select-action="all">Select all</button>
+    <button type="button" class="secondary-button compact-button"
+            data-select-action="none">Deselect all</button>
+    """
+
+
+def _status_badge(status: str) -> str:
+    class_name = "status-pill"
+    if status in {"processing", "reviewing"}:
+        class_name += " status-loading"
+    return f"<span class=\"{class_name}\">{_h(_status_label(status))}</span>"
+
+
+def _document_label(document: dict[str, Any]) -> str:
+    candidate_id = str(document.get("candidate_id") or "").strip()
+    if candidate_id:
+        return f"Candidate {candidate_id}"
+    return f"Document {str(document.get('id', ''))[:8]}"
+
+
+def _privacy_filename(document: dict[str, Any]) -> str:
+    return f"{_document_label(document).lower().replace(' ', '-')}.pdf"
+
+
+def _candidate_name_hints(document: dict[str, Any]) -> list[str]:
+    hints = []
+    for key in ("candidate_name_hint",):
+        value = str(document.get(key) or "").strip()
+        if value:
+            hints.append(value)
+    return hints
 
 
 def _document_view_href(project_id: str, document_id: str, view: str) -> str:
@@ -1732,7 +2025,9 @@ def _status_label(status: str) -> str:
         "uploaded": "Needs PII review",
         "pii_review": "PII review",
         "redacted": "Redacted",
+        "processing": "Processing markdown",
         "processed": "Processed",
+        "reviewing": "Reviewing",
         "reviewed": "Reviewed",
     }
     return labels.get(status, status)
@@ -2149,7 +2444,13 @@ def _page(title: str, body: str) -> str:
     .table-action {{
       display: flex;
       justify-content: flex-end;
+      align-items: center;
+      gap: 8px;
       margin-top: 10px;
+    }}
+    .compact-button {{
+      padding: 8px 10px;
+      font-size: 12px;
     }}
     .empty-cell {{
       color: var(--muted);
@@ -2184,6 +2485,47 @@ def _page(title: str, body: str) -> str:
     }}
     .side-note p {{
       margin: 0;
+    }}
+    .reset-form {{
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }}
+    .danger-button {{
+      background: #b42318;
+    }}
+    .danger-button:hover {{
+      background: #8f1d14;
+    }}
+    .status-pill {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 26px;
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface-soft);
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }}
+    .status-loading {{
+      color: var(--accent-dark);
+      border-color: #a7e3d8;
+      background: #ecfdf9;
+    }}
+    .status-loading::before {{
+      content: "";
+      width: 9px;
+      height: 9px;
+      border: 2px solid #a7e3d8;
+      border-top-color: var(--accent-dark);
+      border-radius: 999px;
+      animation: spin 0.9s linear infinite;
+    }}
+    @keyframes spin {{
+      to {{ transform: rotate(360deg); }}
     }}
     .document-shell {{
       width: min(1040px, 100%);
@@ -2330,8 +2672,8 @@ def _page(title: str, body: str) -> str:
       min-height: 8px;
       padding: 0;
       color: #ffffff;
-      background: rgb(180 35 24 / 18%);
-      border: 2px solid #b42318;
+      background: #000000;
+      border: 2px solid #000000;
       border-radius: 2px;
       cursor: pointer;
     }}
@@ -2352,15 +2694,20 @@ def _page(title: str, body: str) -> str:
       display: block;
     }}
     .redaction-box:not(.selected) {{
-      background: rgb(102 112 133 / 10%);
+      background: transparent;
       border-color: #98a2b3;
+      border-style: dashed;
     }}
     .redaction-box.manual {{
-      background: rgb(15 118 110 / 18%);
-      border-color: var(--accent);
+      background: #000000;
+      border-color: #000000;
     }}
     .redaction-box.manual span {{
       background: var(--accent);
+    }}
+    .redaction-box.manual:not(.selected) {{
+      background: transparent;
+      border-color: var(--accent);
     }}
     .package-shell {{
       width: min(1260px, 100%);
@@ -2429,6 +2776,7 @@ def _page(title: str, body: str) -> str:
 </head>
 <body>
   <main>{body}</main>
+  {_interaction_script()}
 </body>
 </html>
 """

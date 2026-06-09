@@ -386,13 +386,9 @@ def _looks_like_candidate_id(token: str) -> bool:
 
 
 def _candidate_filename(candidate_name: str, candidate_id: str, ordinal: int) -> str:
-    parts = []
     if candidate_id.strip():
-        parts.append(candidate_id.strip())
-    if candidate_name.strip():
-        parts.append(candidate_name.strip())
-    stem = "-".join(slugify(part, fallback="") for part in parts if part.strip())
-    return f"{stem or f'candidate-{ordinal}'}.pdf"
+        return f"{slugify(candidate_id, fallback=f'candidate-{ordinal}')}.pdf"
+    return f"candidate-{ordinal}.pdf"
 
 
 def _unique_filename(filename: str, used: set[str], output_dir: Path) -> str:

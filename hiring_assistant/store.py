@@ -12,7 +12,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-DOCUMENT_STATUSES = {"uploaded", "pii_review", "redacted", "processed", "reviewed"}
+DOCUMENT_STATUSES = {
+    "uploaded",
+    "pii_review",
+    "redacted",
+    "processing",
+    "processed",
+    "reviewing",
+    "reviewed",
+}
 
 
 def utc_now() -> str:
@@ -70,6 +78,12 @@ class ProjectStore:
         self.projects_dir.mkdir(parents=True, exist_ok=True)
         if not self.index_path.exists():
             self._write_json(self.index_path, {"projects": []})
+
+    def reset_all(self) -> None:
+        """Delete all local project data and recreate an empty store."""
+        if self.data_dir.exists():
+            shutil.rmtree(self.data_dir)
+        self.ensure_ready()
 
     def list_projects(self) -> list[dict[str, Any]]:
         """Return projects sorted newest first."""

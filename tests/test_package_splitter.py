@@ -37,8 +37,8 @@ def test_analyze_and_split_linked_resume_package(tmp_path: Path):
     )
 
     assert [output.filename for output in outputs] == [
-        "c001-jordan-lee.pdf",
-        "c002-priya-shah.pdf",
+        "c001.pdf",
+        "c002.pdf",
     ]
     first = fitz.open(outputs[0].path)
     try:

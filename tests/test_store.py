@@ -45,3 +45,15 @@ def test_project_store_keeps_projects_isolated(tmp_path):
     assert first_loaded["documents"][0]["pdf_path"] != second_loaded["documents"][0][
         "pdf_path"
     ]
+
+
+def test_project_store_resets_local_data(tmp_path):
+    """It can wipe all local projects and recreate an empty index."""
+    store = ProjectStore(tmp_path / "data")
+    project = store.create_project("GG08 Posting")
+    store.add_uploads(project["id"], [UploadedFile("First.pdf", b"%PDF first")])
+
+    store.reset_all()
+
+    assert store.list_projects() == []
+    assert store.index_path.exists()
