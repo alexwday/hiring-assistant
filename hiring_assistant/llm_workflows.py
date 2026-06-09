@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
+import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -28,6 +32,11 @@ AGGREGATE_WEIGHTS = {
     "experience_score": Decimal("0.45"),
     "projects_score": Decimal("0.30"),
 }
+DEFAULT_PARALLEL_LLM_CALLS = 8
+DEFAULT_PAGE_WORKERS = 8
+_LLM_SEMAPHORE_LOCK = threading.Lock()
+_LLM_SEMAPHORE: threading.BoundedSemaphore | None = None
+_LLM_SEMAPHORE_LIMIT = 0
 
 
 @dataclass(frozen=True)
@@ -70,20 +79,13 @@ class ResumeLLMService:
         original_filename: str,
     ) -> ProcessedResume:
         """Convert page images into markdown and extract candidate metadata."""
+        page_markdown = self._extract_pages_markdown_parallel(
+            page_paths=page_paths,
+            original_filename=original_filename,
+        )
+        markdown = self._combine_page_markdown(page_markdown, original_filename)
         client = LLMClient(config=self.config, ssl_setup=self.ssl_setup)
         try:
-            page_markdown = []
-            for index, page_path in enumerate(page_paths, start=1):
-                page_markdown.append(
-                    self._extract_page_markdown(
-                        client=client,
-                        page_path=page_path,
-                        original_filename=original_filename,
-                        page_number=index,
-                        page_count=len(page_paths),
-                    )
-                )
-            markdown = self._combine_page_markdown(page_markdown, original_filename)
             metadata = self._extract_metadata(client, markdown)
         finally:
             client.close()
@@ -96,6 +98,69 @@ class ResumeLLMService:
                 "metadata": METADATA_PROMPT_VERSION,
             },
         )
+
+    def _extract_pages_markdown_parallel(
+        self,
+        page_paths: list[Path],
+        original_filename: str,
+    ) -> list[str]:
+        page_count = len(page_paths)
+        workers = _worker_count(
+            "APP_PAGE_WORKERS",
+            DEFAULT_PAGE_WORKERS,
+            page_count,
+        )
+        if workers <= 1:
+            client = LLMClient(config=self.config, ssl_setup=self.ssl_setup)
+            try:
+                return [
+                    self._extract_page_markdown(
+                        client=client,
+                        page_path=page_path,
+                        original_filename=original_filename,
+                        page_number=index,
+                        page_count=page_count,
+                    )
+                    for index, page_path in enumerate(page_paths, start=1)
+                ]
+            finally:
+                client.close()
+
+        page_markdown = [""] * page_count
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    self._extract_page_markdown_with_client,
+                    page_path,
+                    original_filename,
+                    index,
+                    page_count,
+                ): index
+                for index, page_path in enumerate(page_paths, start=1)
+            }
+            for future in as_completed(futures):
+                page_index = futures[future]
+                page_markdown[page_index - 1] = future.result()
+        return page_markdown
+
+    def _extract_page_markdown_with_client(
+        self,
+        page_path: Path,
+        original_filename: str,
+        page_number: int,
+        page_count: int,
+    ) -> str:
+        client = LLMClient(config=self.config, ssl_setup=self.ssl_setup)
+        try:
+            return self._extract_page_markdown(
+                client=client,
+                page_path=page_path,
+                original_filename=original_filename,
+                page_number=page_number,
+                page_count=page_count,
+            )
+        finally:
+            client.close()
 
     def review_resume(
         self,
@@ -204,7 +269,8 @@ class ResumeLLMService:
                 ],
             },
         ]
-        response = client.call(
+        response = _guarded_llm_call(
+            client,
             messages=messages,
             settings={
                 "model_size": "small",
@@ -248,7 +314,8 @@ class ResumeLLMService:
                 ),
             },
         ]
-        response = client.call(
+        response = _guarded_llm_call(
+            client,
             messages=messages,
             settings={
                 "model_size": "small",
@@ -408,7 +475,8 @@ class ResumeLLMService:
                 ),
             },
         ]
-        response = client.call(
+        response = _guarded_llm_call(
+            client,
             messages=messages,
             settings={
                 "model_size": "small",
@@ -488,7 +556,8 @@ class ResumeLLMService:
                 ),
             },
         ]
-        response = client.call(
+        response = _guarded_llm_call(
+            client,
             messages=messages,
             settings={
                 "model_size": "small",
@@ -526,6 +595,61 @@ def parse_json_object(text: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("LLM response was not a JSON object")
     return payload
+
+
+def _guarded_llm_call(
+    client: LLMClient,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    with _llm_call_slot():
+        return client.call(
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            settings=settings,
+        )
+
+
+@contextlib.contextmanager
+def _llm_call_slot() -> Any:
+    semaphore = _llm_call_semaphore()
+    semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
+def _llm_call_semaphore() -> threading.BoundedSemaphore:
+    global _LLM_SEMAPHORE, _LLM_SEMAPHORE_LIMIT
+    limit = _env_int("APP_MAX_PARALLEL_LLM_CALLS", DEFAULT_PARALLEL_LLM_CALLS)
+    with _LLM_SEMAPHORE_LOCK:
+        if _LLM_SEMAPHORE is None or _LLM_SEMAPHORE_LIMIT != limit:
+            _LLM_SEMAPHORE = threading.BoundedSemaphore(limit)
+            _LLM_SEMAPHORE_LIMIT = limit
+        return _LLM_SEMAPHORE
+
+
+def _worker_count(env_name: str, default: int, item_count: int) -> int:
+    if item_count <= 1:
+        return 1
+    return min(item_count, _env_int(env_name, default))
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer; got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1; got {value}")
+    return value
 
 
 def render_review_markdown(payload: dict[str, Any]) -> str:

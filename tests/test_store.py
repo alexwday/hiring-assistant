@@ -1,5 +1,7 @@
 """Tests for local project and document storage."""
 
+from concurrent.futures import ThreadPoolExecutor
+
 from hiring_assistant.store import ProjectStore, UploadedFile
 
 
@@ -57,3 +59,32 @@ def test_project_store_resets_local_data(tmp_path):
 
     assert store.list_projects() == []
     assert store.index_path.exists()
+
+
+def test_project_store_handles_concurrent_document_updates(tmp_path):
+    """It preserves document records when background workers update together."""
+    store = ProjectStore(tmp_path / "data")
+    project = store.create_project("GG08 Posting")
+    documents = store.add_uploads(
+        project["id"],
+        [
+            UploadedFile(f"Resume {index}.pdf", f"%PDF {index}".encode("utf-8"))
+            for index in range(8)
+        ],
+    )
+
+    def update_document(document_id: str) -> None:
+        store.update_document(
+            project["id"],
+            document_id,
+            status="redacted",
+            processing_error="",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(update_document, [document["id"] for document in documents]))
+
+    loaded = store.load_project(project["id"])
+
+    assert len(loaded["documents"]) == 8
+    assert {document["status"] for document in loaded["documents"]} == {"redacted"}

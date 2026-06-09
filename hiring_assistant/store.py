@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import shutil
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -72,68 +73,75 @@ class ProjectStore:
         self.data_dir = Path(data_dir)
         self.projects_dir = self.data_dir / "projects"
         self.index_path = self.projects_dir / "index.json"
+        self.lock = threading.RLock()
 
     def ensure_ready(self) -> None:
         """Create the local data directories and index file."""
-        self.projects_dir.mkdir(parents=True, exist_ok=True)
-        if not self.index_path.exists():
-            self._write_json(self.index_path, {"projects": []})
+        with self.lock:
+            self.projects_dir.mkdir(parents=True, exist_ok=True)
+            if not self.index_path.exists():
+                self._write_json(self.index_path, {"projects": []})
 
     def reset_all(self) -> None:
         """Delete all local project data and recreate an empty store."""
-        if self.data_dir.exists():
-            shutil.rmtree(self.data_dir)
-        self.ensure_ready()
+        with self.lock:
+            if self.data_dir.exists():
+                shutil.rmtree(self.data_dir)
+            self.ensure_ready()
 
     def list_projects(self) -> list[dict[str, Any]]:
         """Return projects sorted newest first."""
-        self.ensure_ready()
-        index = self._read_json(self.index_path, {"projects": []})
-        return sorted(
-            index.get("projects", []),
-            key=lambda item: item.get("updated_at", item.get("created_at", "")),
-            reverse=True,
-        )
+        with self.lock:
+            self.ensure_ready()
+            index = self._read_json(self.index_path, {"projects": []})
+            return sorted(
+                index.get("projects", []),
+                key=lambda item: item.get("updated_at", item.get("created_at", "")),
+                reverse=True,
+            )
 
     def create_project(self, name: str) -> dict[str, Any]:
         """Create a new project and return its manifest."""
-        self.ensure_ready()
-        now = utc_now()
-        project_id = self._new_project_id(name)
-        project_dir = self.project_dir(project_id)
-        project_dir.mkdir(parents=True, exist_ok=False)
-        for child in ("documents", "packages", "reviews"):
-            (project_dir / child).mkdir(parents=True, exist_ok=True)
+        with self.lock:
+            self.ensure_ready()
+            now = utc_now()
+            project_id = self._new_project_id(name)
+            project_dir = self.project_dir(project_id)
+            project_dir.mkdir(parents=True, exist_ok=False)
+            for child in ("documents", "packages", "reviews"):
+                (project_dir / child).mkdir(parents=True, exist_ok=True)
 
-        project = {
-            "id": project_id,
-            "name": name.strip() or "Untitled project",
-            "job_posting": "",
-            "work_context": "",
-            "created_at": now,
-            "updated_at": now,
-            "documents": [],
-            "packages": [],
-        }
-        self.save_project(project)
-        self._upsert_index_project(project)
-        return project
+            project = {
+                "id": project_id,
+                "name": name.strip() or "Untitled project",
+                "job_posting": "",
+                "work_context": "",
+                "created_at": now,
+                "updated_at": now,
+                "documents": [],
+                "packages": [],
+            }
+            self.save_project(project)
+            self._upsert_index_project(project)
+            return project
 
     def load_project(self, project_id: str) -> dict[str, Any]:
         """Load one project manifest."""
-        self.ensure_ready()
-        project_path = self.project_path(project_id)
-        if not project_path.exists():
-            raise KeyError(f"Project not found: {project_id}")
-        return self._read_json(project_path, {})
+        with self.lock:
+            self.ensure_ready()
+            project_path = self.project_path(project_id)
+            if not project_path.exists():
+                raise KeyError(f"Project not found: {project_id}")
+            return self._read_json(project_path, {})
 
     def save_project(self, project: dict[str, Any]) -> None:
         """Persist one project manifest and update the index."""
-        project["updated_at"] = utc_now()
-        project_path = self.project_path(project["id"])
-        project_path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json(project_path, project)
-        self._upsert_index_project(project)
+        with self.lock:
+            project["updated_at"] = utc_now()
+            project_path = self.project_path(project["id"])
+            project_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_json(project_path, project)
+            self._upsert_index_project(project)
 
     def update_project_context(
         self,
@@ -142,11 +150,12 @@ class ProjectStore:
         work_context: str,
     ) -> dict[str, Any]:
         """Save the job posting and optional work context."""
-        project = self.load_project(project_id)
-        project["job_posting"] = job_posting.strip()
-        project["work_context"] = work_context.strip()
-        self.save_project(project)
-        return project
+        with self.lock:
+            project = self.load_project(project_id)
+            project["job_posting"] = job_posting.strip()
+            project["work_context"] = work_context.strip()
+            self.save_project(project)
+            return project
 
     def add_uploads(
         self,
@@ -154,63 +163,67 @@ class ProjectStore:
         uploaded_files: list[UploadedFile],
     ) -> list[dict[str, Any]]:
         """Store uploaded PDFs and append document records to the project."""
-        project = self.load_project(project_id)
-        upload_date = current_date_slug()
-        uploads_dir = (
-            self.project_dir(project_id)
-            / "documents"
-            / upload_date
-            / "uploaded"
-        )
-        uploads_dir.mkdir(parents=True, exist_ok=True)
+        with self.lock:
+            project = self.load_project(project_id)
+            upload_date = current_date_slug()
+            uploads_dir = (
+                self.project_dir(project_id)
+                / "documents"
+                / upload_date
+                / "uploaded"
+            )
+            uploads_dir.mkdir(parents=True, exist_ok=True)
 
-        created: list[dict[str, Any]] = []
-        for uploaded_file in uploaded_files:
-            if not uploaded_file.filename.lower().endswith(".pdf"):
-                continue
-            document_id = uuid.uuid4().hex
-            digest = hashlib.sha256(uploaded_file.content).hexdigest()
-            stored_name = f"{document_id}-{safe_filename(uploaded_file.filename)}"
-            target_path = uploads_dir / stored_name
-            target_path.write_bytes(uploaded_file.content)
-            duplicate_of = self._find_duplicate(project, digest)
-            document = {
-                "id": document_id,
-                "status": "uploaded",
-                "original_filename": uploaded_file.filename,
-                "stored_filename": stored_name,
-                "file_sha256": digest,
-                "duplicate_of": duplicate_of,
-                "upload_date": upload_date,
-                "uploaded_at": utc_now(),
-                "processed_at": "",
-                "pii_review_at": "",
-                "redacted_at": "",
-                "reviewed_at": "",
-                "pdf_path": relative_path(target_path, self.project_dir(project_id)),
-                "redacted_pdf_path": "",
-                "pii_page_image_paths": [],
-                "redacted_page_image_paths": [],
-                "page_image_paths": [],
-                "markdown_path": "",
-                "review_markdown_path": "",
-                "review_json_path": "",
-                "metadata": {},
-                "scores": {},
-                "pii_detections": [],
-                "redactions": [],
-                "original_pdf_deleted": False,
-                "processing_error": "",
-                "pii_error": "",
-                "review_error": "",
-                "prompt_versions": {},
-            }
-            project["documents"].append(document)
-            created.append(document)
+            created: list[dict[str, Any]] = []
+            for uploaded_file in uploaded_files:
+                if not uploaded_file.filename.lower().endswith(".pdf"):
+                    continue
+                document_id = uuid.uuid4().hex
+                digest = hashlib.sha256(uploaded_file.content).hexdigest()
+                stored_name = f"{document_id}-{safe_filename(uploaded_file.filename)}"
+                target_path = uploads_dir / stored_name
+                target_path.write_bytes(uploaded_file.content)
+                duplicate_of = self._find_duplicate(project, digest)
+                document = {
+                    "id": document_id,
+                    "status": "uploaded",
+                    "original_filename": uploaded_file.filename,
+                    "stored_filename": stored_name,
+                    "file_sha256": digest,
+                    "duplicate_of": duplicate_of,
+                    "upload_date": upload_date,
+                    "uploaded_at": utc_now(),
+                    "processed_at": "",
+                    "pii_review_at": "",
+                    "redacted_at": "",
+                    "reviewed_at": "",
+                    "pdf_path": relative_path(
+                        target_path,
+                        self.project_dir(project_id),
+                    ),
+                    "redacted_pdf_path": "",
+                    "pii_page_image_paths": [],
+                    "redacted_page_image_paths": [],
+                    "page_image_paths": [],
+                    "markdown_path": "",
+                    "review_markdown_path": "",
+                    "review_json_path": "",
+                    "metadata": {},
+                    "scores": {},
+                    "pii_detections": [],
+                    "redactions": [],
+                    "original_pdf_deleted": False,
+                    "processing_error": "",
+                    "pii_error": "",
+                    "review_error": "",
+                    "prompt_versions": {},
+                }
+                project["documents"].append(document)
+                created.append(document)
 
-        if created:
-            self.save_project(project)
-        return created
+            if created:
+                self.save_project(project)
+            return created
 
     def create_package_upload(
         self,
@@ -219,35 +232,39 @@ class ProjectStore:
         index_pages: int,
     ) -> dict[str, Any]:
         """Store one combined resume package PDF for later splitting."""
-        project = self.load_project(project_id)
-        if not uploaded_file.filename.lower().endswith(".pdf"):
-            raise ValueError("Package upload must be a PDF")
-        package_id = uuid.uuid4().hex
-        package_dir = self.project_dir(project_id) / "packages" / package_id
-        package_dir.mkdir(parents=True, exist_ok=False)
-        stored_name = f"source-{safe_filename(uploaded_file.filename)}"
-        target_path = package_dir / stored_name
-        target_path.write_bytes(uploaded_file.content)
-        now = utc_now()
-        package = {
-            "id": package_id,
-            "status": "draft",
-            "original_filename": uploaded_file.filename,
-            "stored_filename": stored_name,
-            "source_pdf_path": relative_path(target_path, self.project_dir(project_id)),
-            "index_pages": max(1, int(index_pages or 1)),
-            "page_count": 0,
-            "candidate_rows": [],
-            "warnings": [],
-            "created_document_ids": [],
-            "created_at": now,
-            "analyzed_at": "",
-            "split_at": "",
-            "error": "",
-        }
-        project.setdefault("packages", []).append(package)
-        self.save_project(project)
-        return package
+        with self.lock:
+            project = self.load_project(project_id)
+            if not uploaded_file.filename.lower().endswith(".pdf"):
+                raise ValueError("Package upload must be a PDF")
+            package_id = uuid.uuid4().hex
+            package_dir = self.project_dir(project_id) / "packages" / package_id
+            package_dir.mkdir(parents=True, exist_ok=False)
+            stored_name = f"source-{safe_filename(uploaded_file.filename)}"
+            target_path = package_dir / stored_name
+            target_path.write_bytes(uploaded_file.content)
+            now = utc_now()
+            package = {
+                "id": package_id,
+                "status": "draft",
+                "original_filename": uploaded_file.filename,
+                "stored_filename": stored_name,
+                "source_pdf_path": relative_path(
+                    target_path,
+                    self.project_dir(project_id),
+                ),
+                "index_pages": max(1, int(index_pages or 1)),
+                "page_count": 0,
+                "candidate_rows": [],
+                "warnings": [],
+                "created_document_ids": [],
+                "created_at": now,
+                "analyzed_at": "",
+                "split_at": "",
+                "error": "",
+            }
+            project.setdefault("packages", []).append(package)
+            self.save_project(project)
+            return package
 
     def update_package(
         self,
@@ -256,11 +273,12 @@ class ProjectStore:
         **updates: Any,
     ) -> dict[str, Any]:
         """Patch one package record and save the project."""
-        project = self.load_project(project_id)
-        package = self.get_package(project, package_id)
-        package.update(updates)
-        self.save_project(project)
-        return package
+        with self.lock:
+            project = self.load_project(project_id)
+            package = self.get_package(project, package_id)
+            package.update(updates)
+            self.save_project(project)
+            return package
 
     def get_package(
         self,
@@ -280,13 +298,14 @@ class ProjectStore:
         **updates: Any,
     ) -> dict[str, Any]:
         """Patch one document record and save the project."""
-        project = self.load_project(project_id)
-        document = self.get_document(project, document_id)
-        if "status" in updates and updates["status"] not in DOCUMENT_STATUSES:
-            raise ValueError(f"Invalid status: {updates['status']}")
-        document.update(updates)
-        self.save_project(project)
-        return document
+        with self.lock:
+            project = self.load_project(project_id)
+            document = self.get_document(project, document_id)
+            if "status" in updates and updates["status"] not in DOCUMENT_STATUSES:
+                raise ValueError(f"Invalid status: {updates['status']}")
+            document.update(updates)
+            self.save_project(project)
+            return document
 
     def get_document(
         self,
@@ -309,10 +328,11 @@ class ProjectStore:
 
     def write_project_text(self, project_id: str, relative: str, text: str) -> Path:
         """Write UTF-8 text under a project directory."""
-        path = self.resolve_project_path(project_id, relative)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-        return path
+        with self.lock:
+            path = self.resolve_project_path(project_id, relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            return path
 
     def write_project_json(
         self,
@@ -321,10 +341,11 @@ class ProjectStore:
         payload: dict[str, Any],
     ) -> Path:
         """Write JSON under a project directory."""
-        path = self.resolve_project_path(project_id, relative)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_json(path, payload)
-        return path
+        with self.lock:
+            path = self.resolve_project_path(project_id, relative)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_json(path, payload)
+            return path
 
     def project_dir(self, project_id: str) -> Path:
         """Return the project directory."""

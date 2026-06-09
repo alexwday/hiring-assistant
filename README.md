@@ -130,6 +130,22 @@ SSL_VERIFY=true
 The small model profile is used for resume vision extraction, metadata
 extraction, and candidate review.
 
+## LLM Concurrency
+
+Selected resume processing and review batches run LLM calls in parallel. The
+default is tuned for up to 8 simultaneous LLM calls across the whole local app:
+
+```bash
+APP_MAX_PARALLEL_LLM_CALLS=8
+APP_PROCESS_WORKERS=8
+APP_REVIEW_WORKERS=8
+APP_PAGE_WORKERS=8
+```
+
+`APP_MAX_PARALLEL_LLM_CALLS` is the global cap. The worker values control how
+many documents or resume pages can be queued at once, but the global cap keeps
+the actual API call count bounded.
+
 ## PDF Rendering
 
 Resume PDFs are rendered page by page using `pdftoppm` from poppler before being

@@ -11,6 +11,7 @@ import os
 import re
 import threading
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email import policy
 from email.parser import BytesParser
@@ -41,6 +42,8 @@ logger = logging.getLogger(__name__)
 ADVANCE_RECOMMENDATION = "Advance to prescreen"
 HOLD_RECOMMENDATION = "Hold after top six"
 ONE_DECIMAL = Decimal("0.1")
+DEFAULT_PROCESS_WORKERS = 8
+DEFAULT_REVIEW_WORKERS = 8
 
 
 class HiringAssistantHTTPServer(ThreadingHTTPServer):
@@ -1144,45 +1147,95 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         project_id: str,
         document_ids: list[str],
     ) -> None:
-        service = ResumeLLMService(self.server.config, self.server.ssl_setup)
-        for document_id in document_ids:
-            try:
-                self._process_one_resume(project_id, document_id, service)
-            except Exception as exc:
-                logger.exception("Background resume processing failed: %s", document_id)
-                self.server.store.update_document(
+        workers = _worker_count(
+            "APP_PROCESS_WORKERS",
+            DEFAULT_PROCESS_WORKERS,
+            len(document_ids),
+        )
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    self._process_one_resume_with_service,
                     project_id,
                     document_id,
-                    status="redacted",
-                    processing_error=str(exc),
-                )
+                ): document_id
+                for document_id in document_ids
+            }
+            for future in as_completed(futures):
+                document_id = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    logger.exception(
+                        "Background resume processing failed: %s",
+                        document_id,
+                    )
+                    self.server.store.update_document(
+                        project_id,
+                        document_id,
+                        status="redacted",
+                        processing_error=str(exc),
+                    )
 
     def _review_resume_batch(
         self,
         project_id: str,
         document_ids: list[str],
     ) -> None:
-        service = ResumeLLMService(self.server.config, self.server.ssl_setup)
-        for document_id in document_ids:
-            try:
-                self._review_one_resume(project_id, document_id, service)
-            except Exception as exc:
-                logger.exception("Background resume review failed: %s", document_id)
-                fallback_status = "processed"
-                try:
-                    project = self.server.store.load_project(project_id)
-                    document = self.server.store.get_document(project, document_id)
-                    if document.get("rerun_review"):
-                        fallback_status = "reviewed"
-                except KeyError:
-                    pass
-                self.server.store.update_document(
+        workers = _worker_count(
+            "APP_REVIEW_WORKERS",
+            DEFAULT_REVIEW_WORKERS,
+            len(document_ids),
+        )
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    self._review_one_resume_with_service,
                     project_id,
                     document_id,
-                    status=fallback_status,
-                    review_error=str(exc),
-                    rerun_review=False,
-                )
+                ): document_id
+                for document_id in document_ids
+            }
+            for future in as_completed(futures):
+                document_id = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    logger.exception(
+                        "Background resume review failed: %s",
+                        document_id,
+                    )
+                    fallback_status = "processed"
+                    try:
+                        project = self.server.store.load_project(project_id)
+                        document = self.server.store.get_document(project, document_id)
+                        if document.get("rerun_review"):
+                            fallback_status = "reviewed"
+                    except KeyError:
+                        pass
+                    self.server.store.update_document(
+                        project_id,
+                        document_id,
+                        status=fallback_status,
+                        review_error=str(exc),
+                        rerun_review=False,
+                    )
+
+    def _process_one_resume_with_service(
+        self,
+        project_id: str,
+        document_id: str,
+    ) -> None:
+        service = ResumeLLMService(self.server.config, self.server.ssl_setup)
+        self._process_one_resume(project_id, document_id, service)
+
+    def _review_one_resume_with_service(
+        self,
+        project_id: str,
+        document_id: str,
+    ) -> None:
+        service = ResumeLLMService(self.server.config, self.server.ssl_setup)
+        self._review_one_resume(project_id, document_id, service)
 
     def _screen_one_resume(self, project_id: str, document_id: str) -> None:
         project = self.server.store.load_project(project_id)
@@ -2753,25 +2806,26 @@ def _rerank_reviewed_recommendations(
     store: ProjectStore,
     project_id: str,
 ) -> None:
-    project = store.load_project(project_id)
-    reviewed = [
-        document
-        for document in project.get("documents", [])
-        if document.get("status") == "reviewed"
-    ]
-    ranked_documents = _rank_reviewed_documents(reviewed)
-    total = len(ranked_documents)
-    for ranked in ranked_documents:
-        document = ranked["document"]
-        scores = dict(document.get("scores") or {})
-        scores["screening_average"] = ranked["average"]
-        scores["project_rank"] = ranked["rank"]
-        scores["recommendation"] = ranked["recommendation"]
-        scores["located_in_canada"] = _boolish(scores.get("located_in_canada"))
-        document["scores"] = scores
-        _update_review_artifacts(store, project_id, document, ranked, total)
-    if ranked_documents:
-        store.save_project(project)
+    with store.lock:
+        project = store.load_project(project_id)
+        reviewed = [
+            document
+            for document in project.get("documents", [])
+            if document.get("status") == "reviewed"
+        ]
+        ranked_documents = _rank_reviewed_documents(reviewed)
+        total = len(ranked_documents)
+        for ranked in ranked_documents:
+            document = ranked["document"]
+            scores = dict(document.get("scores") or {})
+            scores["screening_average"] = ranked["average"]
+            scores["project_rank"] = ranked["rank"]
+            scores["recommendation"] = ranked["recommendation"]
+            scores["located_in_canada"] = _boolish(scores.get("located_in_canada"))
+            document["scores"] = scores
+            _update_review_artifacts(store, project_id, document, ranked, total)
+        if ranked_documents:
+            store.save_project(project)
 
 
 def _update_review_artifacts(
@@ -4214,6 +4268,25 @@ def _canada_flag(scores: dict[str, Any]) -> str:
         "<span class=\"canada-flag\" title=\"Located in Canada\" "
         "aria-label=\"Located in Canada\">&#x1F1E8;&#x1F1E6;</span>"
     )
+
+
+def _worker_count(env_name: str, default: int, item_count: int) -> int:
+    if item_count <= 1:
+        return 1
+    return min(item_count, _env_int(env_name, default))
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer; got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be >= 1; got {value}")
+    return value
 
 
 def _score(value: Any) -> str:
