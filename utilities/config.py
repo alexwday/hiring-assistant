@@ -151,9 +151,15 @@ def load_config(
             mode=_auth_mode(),
             api_key=_env_any(["OPENAI_API_KEY", "API_KEY"], ""),
             oauth=OAuthConfig(
-                token_endpoint=_env_any(["OAUTH_TOKEN_ENDPOINT", "OAUTH_ENDPOINT"], ""),
-                client_id=_env("OAUTH_CLIENT_ID", ""),
-                client_secret=_env("OAUTH_CLIENT_SECRET", ""),
+                token_endpoint=_env_any(
+                    ["OAUTH_TOKEN_ENDPOINT", "OAUTH_ENDPOINT", "OAUTH_URL"],
+                    "",
+                ),
+                client_id=_env_any(["OAUTH_CLIENT_ID", "CLIENT_ID"], ""),
+                client_secret=_env_any(
+                    ["OAUTH_CLIENT_SECRET", "CLIENT_SECRET"],
+                    "",
+                ),
                 grant_type=_env("OAUTH_GRANT_TYPE", "client_credentials"),
                 scope=_env("OAUTH_SCOPE", ""),
                 retry=OAuthRetryConfig(
@@ -184,10 +190,10 @@ def load_config(
         ),
         llm=LLMConfig(
             base_url=_env_any(
-                ["LLM_BASE_URL", "LLM_DEFAULT_URL"],
+                ["LLM_BASE_URL", "LLM_DEFAULT_URL", "AZURE_BASE_URL"],
                 "https://api.openai.com/v1",
             ).rstrip("/"),
-            small=_load_llm_profile("SMALL", default_model="gpt-5.4"),
+            small=_load_llm_profile("SMALL", default_model="gpt-5.4-mini"),
             large=_load_llm_profile("LARGE", default_model="gpt-5.4"),
         ),
         prompt=PromptConfig(
@@ -309,6 +315,8 @@ def _load_llm_profile(size: str, default_model: str) -> LLMModelConfig:
     """Load one LLM profile from suffixed environment variables."""
     legacy_suffixes = [""] if size == "SMALL" else []
     model_names = [f"LLM_MODEL_{size}", *(f"LLM_MODEL{s}" for s in legacy_suffixes)]
+    if size == "SMALL":
+        model_names.append("VISION_MODEL")
     max_tokens_names = [
         f"LLM_MAX_TOKENS_{size}",
         *(f"LLM_MAX_TOKENS{s}" for s in legacy_suffixes),

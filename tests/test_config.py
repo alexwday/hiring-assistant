@@ -69,3 +69,50 @@ def test_load_config_supports_aegis_aliases(tmp_path: Path, monkeypatch):
     assert config.prompt.model == "base_llm_framework"
     assert config.prompt.layer == "default"
     assert config.prompt.default_prompt == "example"
+
+
+def test_load_config_supports_rbc_vision_test_aliases(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """It supports the env names used by rbc-vision-test."""
+    for name in (
+        "AUTH_MODE",
+        "LLM_AUTH_MODE",
+        "OPENAI_API_KEY",
+        "API_KEY",
+        "LLM_BASE_URL",
+        "LLM_DEFAULT_URL",
+        "AZURE_BASE_URL",
+        "LLM_MODEL",
+        "LLM_MODEL_SMALL",
+        "VISION_MODEL",
+        "OAUTH_TOKEN_ENDPOINT",
+        "OAUTH_ENDPOINT",
+        "OAUTH_URL",
+        "OAUTH_CLIENT_ID",
+        "OAUTH_CLIENT_SECRET",
+        "CLIENT_ID",
+        "CLIENT_SECRET",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "AUTH_MODE=oauth\n"
+        "AZURE_BASE_URL=https://rbc.example.test/v1\n"
+        "VISION_MODEL=gpt-5.4-mini\n"
+        "OAUTH_URL=https://login.example.test/token\n"
+        "CLIENT_ID=test-client\n"
+        "CLIENT_SECRET=test-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    config = load_config(env_file)
+
+    assert config.auth_mode == "oauth"
+    assert config.llm.base_url == "https://rbc.example.test/v1"
+    assert config.llm.small.model == "gpt-5.4-mini"
+    assert config.oauth.token_endpoint == "https://login.example.test/token"
+    assert config.oauth.client_id == "test-client"
+    assert config.oauth.client_secret == "test-secret"

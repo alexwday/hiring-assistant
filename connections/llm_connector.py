@@ -64,7 +64,7 @@ class LLMClient:
 
     def call(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
         settings: dict[str, Any] | None = None,
@@ -148,7 +148,7 @@ class LLMClient:
 
     def _build_chat_kwargs(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         tool_choice: str | dict[str, Any] | None,
         settings: dict[str, Any],

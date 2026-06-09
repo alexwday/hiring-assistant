@@ -1,124 +1,121 @@
-# Base RBC LLM Framework
+# Hiring Assistant
 
-Reusable starter framework for new projects that need a clean path from
-configuration to prompt loading to an OpenAI-compatible LLM call.
+Local resume screening app built on the RBC LLM framework. It runs as a local
+HTML server, stores all uploaded and generated files inside this project, and
+uses the existing OpenAI-compatible auth/base URL/SSL configuration so it works
+both locally and in work environments with OAuth, custom endpoints, and custom
+certificate handling.
 
-## Structure
-
-```text
-connections/
-  oauth_connector.py   # OAuth client-credentials token lifecycle
-  llm_connector.py     # OpenAI-compatible chat client
-
-utilities/
-  config.py            # .env parsing and typed config
-  ssl_setup.py         # RBC/system certificate setup
-  prompt_loader.py     # PostgreSQL prompts table loading
-  conversation.py      # message validation and history trimming
-  logging_setup.py     # redacted local logging
-
-main.py                # setup -> auth -> prompt -> LLM call
-```
-
-## Setup
+## Run
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+python main.py
 ```
 
-Fill in `.env`, then validate without external calls:
-
-```bash
-python -m scripts.seed_example_prompt
-python main.py --dry-run
-```
-
-Run the example prompt:
-
-```bash
-python main.py --prompt example
-```
-
-## Prompt Storage
-
-Prompts are loaded from PostgreSQL table `prompts`; there is no local YAML
-fallback. The base framework reads:
+By default the app starts at:
 
 ```text
-model = base_llm_framework
-layer = default
-name  = example
+http://127.0.0.1:8000
 ```
 
-The table follows the Aegis prompt schema:
+The browser opens automatically unless `APP_OPEN_BROWSER=false` is set or
+`--no-open-browser` is passed.
 
-```sql
-model TEXT NOT NULL
-layer TEXT
-name TEXT NOT NULL
-description TEXT
-comments TEXT
-system_prompt TEXT
-user_prompt TEXT
-tool_definition JSONB
-uses_global TEXT[]
-version TEXT
-created_at TIMESTAMPTZ
-updated_at TIMESTAMPTZ
+## Workflow
+
+1. Create a project for one posting.
+2. Paste the job posting and optional work/context notes.
+3. Upload one or many PDF resumes.
+4. Send uploaded resumes through local PII review.
+5. Finalize redactions so only redacted page images are sent to the LLM.
+6. Process redacted resumes into LLM-readable markdown with non-contact metadata.
+7. Select processed resumes for job-fit review.
+8. Review the generated hiring-manager report and prescreen email template.
+
+Each project keeps its own uploaded, processed, and reviewed resumes. A resume is
+only in one table at a time:
+
+- `uploaded`: PDF is stored locally but has not been reviewed for PII.
+- `pii_review`: local PII boxes are ready for human review.
+- `redacted`: a finalized redacted PDF exists and is ready for LLM processing.
+- `processed`: resume markdown and candidate metadata exist.
+- `reviewed`: job-fit report and scores exist.
+
+## Local Storage
+
+Runtime files are stored under ignored `data/` directories:
+
+```text
+data/projects/
+  index.json
+  <project-id>/
+    project.json
+    documents/
+      YYYY-MM-DD/
+        uploaded/
+        pii-pages/
+        redacted/
+        redacted-pages/
+        pages/
+        processed/
+        reviewed/
 ```
 
-The seed script does not create this table. It verifies the table exists and
-then inserts or updates the example prompt row. Create the table with a
-database owner or migration account before running the seed script.
+No database is required. Do not commit `data/`; it contains resumes and review
+outputs.
 
-Prompt metadata such as `model_size` is stored as JSON in `comments`:
+## PII Redaction
 
-```json
-{
-  "model_size": "small",
-  "settings": {
-    "max_tokens": 400
-  },
-  "tool_choice": "auto"
-}
-```
+The app does not send the uploaded original PDF to the external LLM. Processing
+first renders the PDF locally and runs local PyMuPDF/PyMuPDF4LLM-based text box
+detection for likely contact PII:
 
-Model profiles are defined in `.env`:
+- email addresses
+- phone numbers
+- LinkedIn/profile URLs and personal links
+- postal/ZIP codes
+- address or location lines
+
+The PII review page lets a human finalize detected boxes and draw additional
+manual boxes. After finalization, the app saves a redacted PDF, deletes the
+original uploaded PDF for that document, and sends only redacted page images to
+the vision model. Candidate name is retained.
+
+## LLM Configuration
+
+The app uses the copied framework's `.env` settings:
 
 ```bash
-LLM_MODEL_SMALL=gpt-5.4
-LLM_MAX_TOKENS_SMALL=2048
-
-LLM_MODEL_LARGE=gpt-5.4
-LLM_MAX_TOKENS_LARGE=4096
+AUTH_MODE=local
+OPENAI_API_KEY=
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL_SMALL=gpt-5.4-mini
+SSL_VERIFY=false
 ```
 
-Render variables from the CLI:
+For OAuth/internal environments, set:
 
 ```bash
-python main.py --prompt example --var topic="RBC LLM adoption"
+AUTH_MODE=oauth
+OAUTH_ENDPOINT=
+OAUTH_CLIENT_ID=
+OAUTH_CLIENT_SECRET=
+LLM_BASE_URL=
+SSL_VERIFY=true
 ```
 
-## Auth Modes
+The small model profile is used for resume vision extraction, metadata
+extraction, and candidate review.
 
-`AUTH_MODE=local` uses `OPENAI_API_KEY` or `API_KEY`.
+## PDF Rendering
 
-`AUTH_MODE=oauth` uses `OAUTH_ENDPOINT`, `OAUTH_CLIENT_ID`,
-`OAUTH_CLIENT_SECRET`, and `OAUTH_GRANT_TYPE`.
+Resume PDFs are rendered page by page using `pdftoppm` from poppler before being
+sent to the vision model. On macOS with Homebrew:
 
-The config loader also accepts common Aegis aliases such as
-`LLM_AUTH_MODE=default|oauth`, `LLM_DEFAULT_URL`, and legacy unsuffixed
-`LLM_MODEL` values for the small profile.
-
-## SSL
-
-Set `SSL_VERIFY=true` for internal environments. The setup order is:
-
-1. Try `rbc_security.enable_certs()`.
-2. Warn if `rbc_security` is unavailable.
-3. Fall back to system certificates.
-
-Set `SSL_VERIFY=false` for local development against public endpoints.
+```bash
+brew install poppler
+```
