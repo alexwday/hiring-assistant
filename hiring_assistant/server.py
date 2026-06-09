@@ -2227,24 +2227,27 @@ def _reviewed_export_html(
         <div class="export-body">
           {context_html}
           {rerank_note}
-          <table class="reviewed-export-table">
-            <thead>
-              <tr>
-                <th>Candidate</th><th>Recent role</th><th>Employer</th>
-                <th>Experience</th><th>Canada</th><th>Rank</th>
-                <th>Adjusted</th><th>Final thesis</th>
-                <th>Aggregate</th><th>Holistic</th>
-                <th>Avg</th><th>Recommendation</th>{link_headers}
-              </tr>
-            </thead>
-            <tbody class="top-ten-window">
-              <tr class="section-row">
-                <td colspan="{column_count}">Top 10 final review window</td>
-              </tr>
-              {''.join(top_rows)}
-            </tbody>
-            {lower_body}
-          </table>
+          <div class="reviewed-export-scroll" tabindex="0"
+               aria-label="Reviewed results table scroll area">
+            <table class="reviewed-export-table">
+              <thead>
+                <tr>
+                  <th>Candidate</th><th>Recent role</th><th>Employer</th>
+                  <th>Experience</th><th>Canada</th><th>Rank</th>
+                  <th>Adjusted</th><th>Final thesis</th>
+                  <th>Aggregate</th><th>Holistic</th>
+                  <th>Avg</th><th>Recommendation</th>{link_headers}
+                </tr>
+              </thead>
+              <tbody class="top-ten-window">
+                <tr class="section-row">
+                  <td colspan="{column_count}">Top 10 final review window</td>
+                </tr>
+                {''.join(top_rows)}
+              </tbody>
+              {lower_body}
+            </table>
+          </div>
         </div>
       </article>
     </div>
@@ -3542,7 +3545,8 @@ def _page(title: str, body: str) -> str:
     }}
     .table-panel {{
       padding: 14px;
-      overflow: hidden;
+      overflow-x: auto;
+      overflow-y: hidden;
     }}
     .table-panel-header {{
       display: flex;
@@ -4099,8 +4103,36 @@ def _page(title: str, body: str) -> str:
       padding: 0;
       font-size: 14px;
     }}
+    .reviewed-export-scroll {{
+      width: 100%;
+      max-width: 100%;
+      overflow-x: auto;
+      overflow-y: visible;
+      padding-bottom: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      -webkit-overflow-scrolling: touch;
+    }}
+    .reviewed-export-scroll:focus {{
+      outline: 2px solid #7dd3c7;
+      outline-offset: 2px;
+    }}
+    .reviewed-export-table {{
+      min-width: 1580px;
+      margin: 0;
+    }}
+    .reviewed-export-table th,
+    .reviewed-export-table td {{
+      vertical-align: top;
+    }}
     .reviewed-export-table td:first-child {{
       min-width: 260px;
+    }}
+    .reviewed-export-table .summary-cell {{
+      min-width: 360px;
+      max-width: 520px;
+      white-space: normal;
     }}
     .redaction-form {{
       background: var(--surface-soft);
