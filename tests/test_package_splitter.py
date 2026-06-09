@@ -69,6 +69,22 @@ def test_analyze_cleans_row_numbers_and_adjacent_index_text(tmp_path: Path):
     assert rows[2]["source_text"] == "Priya Shah C009"
 
 
+def test_analyze_recovers_id_when_link_overlaps_id_column(tmp_path: Path):
+    """It can recover candidate ID from the full row when the link starts early."""
+    source_pdf = tmp_path / "package-link-over-id.pdf"
+    _write_link_over_id_package(source_pdf)
+
+    analysis = analyze_resume_package(source_pdf, index_pages=1)
+
+    rows = analysis["candidate_rows"]
+    assert rows[0]["candidate_name"] == "Morgan Patel"
+    assert rows[0]["candidate_id"] == "C007"
+    assert rows[0]["source_text"] == "Morgan Patel C007"
+    assert rows[1]["candidate_name"] == "Jordan Lee"
+    assert rows[1]["candidate_id"] == "C008"
+    assert rows[1]["source_text"] == "Jordan Lee C008"
+
+
 def _write_linked_package(path: Path) -> None:
     document = fitz.open()
     try:
@@ -121,6 +137,39 @@ def _write_row_number_package(path: Path) -> None:
                 {
                     "kind": fitz.LINK_GOTO,
                     "from": fitz.Rect(220, y0, 280, y0 + 28),
+                    "page": target_page,
+                }
+            )
+        document.save(path)
+    finally:
+        document.close()
+
+
+def _write_link_over_id_package(path: Path) -> None:
+    document = fitz.open()
+    try:
+        index = document.new_page()
+        index.insert_text((72, 72), "Candidate Name")
+        index.insert_text((220, 72), "Candidate ID")
+        index.insert_text((310, 72), "Attachments")
+
+        rows = (("7. Morgan Patel", "C007"), ("8. Jordan Lee", "C008"))
+        for row_index, (name, candidate_id) in enumerate(rows):
+            y = 104 + row_index * 24
+            index.insert_text((72, y), name)
+            index.insert_text((220, y), candidate_id)
+            index.insert_text((310, y), "Resume")
+
+        for name, _candidate_id in rows:
+            page = document.new_page()
+            page.insert_text((72, 72), f"{name} resume page")
+
+        index = document[0]
+        for target_page, y0 in enumerate((94, 118), start=1):
+            index.insert_link(
+                {
+                    "kind": fitz.LINK_GOTO,
+                    "from": fitz.Rect(190, y0, 370, y0 + 18),
                     "page": target_page,
                 }
             )

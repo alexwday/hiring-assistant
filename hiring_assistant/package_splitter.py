@@ -127,8 +127,25 @@ def _linked_candidate_rows(
             left_words = [
                 word for word in row_words if float(word[0]) < link_rect.x0 - 1
             ]
-            source_text = _words_text(left_words or row_words)
+            row_text = _words_text(row_words)
+            source_text = _words_text(left_words) if left_words else row_text
             parsed = _parse_candidate_reference(source_text, len(rows) + 1)
+            if not parsed["candidate_id"]:
+                candidate_id = _extract_candidate_id_from_text(
+                    row_text,
+                    parsed["candidate_name"],
+                )
+                if candidate_id:
+                    parsed["candidate_id"] = candidate_id
+                    parsed["source_text"] = " ".join(
+                        part
+                        for part in (
+                            parsed["candidate_name"],
+                            parsed["candidate_id"],
+                        )
+                        if part
+                    )
+                    parsed["confidence"] = "high"
             rows.append(
                 {
                     "candidate_name": parsed["candidate_name"],
@@ -203,14 +220,20 @@ def _words_on_link_row(page: fitz.Page, link_rect: fitz.Rect) -> list[tuple[Any,
 
 
 def _word_lines(words: list[tuple[Any, ...]]) -> list[list[tuple[Any, ...]]]:
-    line_map: dict[tuple[int, int], list[tuple[Any, ...]]] = {}
-    for word in words:
-        key = (int(word[5]), int(word[6]))
-        line_map.setdefault(key, []).append(word)
-    return sorted(
-        line_map.values(),
-        key=lambda line: (_line_center_y(line), min(float(word[0]) for word in line)),
-    )
+    groups: list[list[tuple[Any, ...]]] = []
+    for word in sorted(words, key=lambda item: _word_center_y(item)):
+        if groups and abs(_word_center_y(word) - _line_center_y(groups[-1])) <= 4:
+            groups[-1].append(word)
+        else:
+            groups.append([word])
+    return [
+        sorted(group, key=lambda word: (float(word[1]), float(word[0])))
+        for group in groups
+    ]
+
+
+def _word_center_y(word: tuple[Any, ...]) -> float:
+    return (float(word[1]) + float(word[3])) / 2
 
 
 def _line_center_y(words: list[tuple[Any, ...]]) -> float:
@@ -279,6 +302,44 @@ def _candidate_name_tokens(tokens: list[str]) -> list[str]:
         if _looks_like_row_marker(cleaned) or _looks_like_candidate_id(cleaned):
             cut_after = index
     return tokens[cut_after + 1:]
+
+
+def _extract_candidate_id_from_text(text: str, candidate_name: str) -> str:
+    tokens = _clean_row_text(text).split()
+    if not tokens:
+        return ""
+    normalized_tokens = [_normalize_token(token) for token in tokens]
+    name_tokens = [
+        _normalize_token(token)
+        for token in candidate_name.split()
+        if _normalize_token(token)
+    ]
+    start_index = _candidate_id_search_start(normalized_tokens, name_tokens)
+    for token in tokens[start_index:]:
+        cleaned = token.strip(",:;()[]{}")
+        if _looks_like_candidate_id(cleaned):
+            return cleaned
+    for token in tokens:
+        cleaned = token.strip(",:;()[]{}")
+        if _looks_like_candidate_id(cleaned):
+            return cleaned
+    return ""
+
+
+def _candidate_id_search_start(
+    normalized_tokens: list[str],
+    name_tokens: list[str],
+) -> int:
+    if not name_tokens:
+        return 0
+    for index in range(0, len(normalized_tokens) - len(name_tokens) + 1):
+        if normalized_tokens[index: index + len(name_tokens)] == name_tokens:
+            return index + len(name_tokens)
+    return 0
+
+
+def _normalize_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
 def _clean_row_text(text: str) -> str:
