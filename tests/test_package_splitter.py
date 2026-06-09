@@ -50,6 +50,25 @@ def test_analyze_and_split_linked_resume_package(tmp_path: Path):
         first.close()
 
 
+def test_analyze_cleans_row_numbers_and_adjacent_index_text(tmp_path: Path):
+    """It does not let adjacent numbered rows leak into the candidate name."""
+    source_pdf = tmp_path / "package-with-row-numbers.pdf"
+    _write_row_number_package(source_pdf)
+
+    analysis = analyze_resume_package(source_pdf, index_pages=1)
+
+    rows = analysis["candidate_rows"]
+    assert rows[0]["candidate_name"] == "Morgan Patel"
+    assert rows[0]["candidate_id"] == "C007"
+    assert rows[0]["source_text"] == "Morgan Patel C007"
+    assert rows[1]["candidate_name"] == "Jordan Lee"
+    assert rows[1]["candidate_id"] == "C008"
+    assert rows[1]["source_text"] == "Jordan Lee C008"
+    assert rows[2]["candidate_name"] == "Priya Shah"
+    assert rows[2]["candidate_id"] == "C009"
+    assert rows[2]["source_text"] == "Priya Shah C009"
+
+
 def _write_linked_package(path: Path) -> None:
     document = fitz.open()
     try:
@@ -78,6 +97,33 @@ def _write_linked_package(path: Path) -> None:
                 "page": 2,
             }
         )
+        document.save(path)
+    finally:
+        document.close()
+
+
+def _write_row_number_package(path: Path) -> None:
+    document = fitz.open()
+    try:
+        index = document.new_page()
+        index.insert_text((72, 72), "Candidate Name  Candidate ID  Attachments")
+        index.insert_text((72, 104), "7. Morgan Patel  C007  Resume")
+        index.insert_text((72, 124), "8. Jordan Lee  C008  Resume")
+        index.insert_text((72, 144), "9. Priya Shah  C009  Resume")
+
+        for name in ("Morgan Patel", "Jordan Lee", "Priya Shah"):
+            page = document.new_page()
+            page.insert_text((72, 72), f"{name} resume page")
+
+        index = document[0]
+        for target_page, y0 in enumerate((94, 114, 134), start=1):
+            index.insert_link(
+                {
+                    "kind": fitz.LINK_GOTO,
+                    "from": fitz.Rect(220, y0, 280, y0 + 28),
+                    "page": target_page,
+                }
+            )
         document.save(path)
     finally:
         document.close()

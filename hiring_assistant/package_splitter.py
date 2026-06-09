@@ -136,7 +136,7 @@ def _linked_candidate_rows(
                     "start_page": target_page + 1,
                     "end_page": target_page + 1,
                     "index_page": page_index + 1,
-                    "source_text": source_text,
+                    "source_text": parsed["source_text"],
                     "confidence": parsed["confidence"],
                 }
             )
@@ -182,23 +182,34 @@ def _words_on_link_row(page: fitz.Page, link_rect: fitz.Rect) -> list[tuple[Any,
     words = page.get_text("words", sort=True)
     if not words:
         return []
-    row_words = [
-        word
-        for word in words
-        if float(word[3]) >= link_rect.y0 - 6
-        and float(word[1]) <= link_rect.y1 + 6
-    ]
-    if row_words:
-        return sorted(row_words, key=lambda word: (float(word[1]), float(word[0])))
-
+    lines = _word_lines(words)
+    if not lines:
+        return []
     center_y = (link_rect.y0 + link_rect.y1) / 2
+    overlapping_lines = [
+        line
+        for line in lines
+        if _vertical_overlap(_line_bbox(line), link_rect) > 0
+    ]
+    candidates = overlapping_lines or lines
+    best_line = min(
+        candidates,
+        key=lambda line: (
+            abs(_line_center_y(line) - center_y),
+            -_vertical_overlap(_line_bbox(line), link_rect),
+        ),
+    )
+    return sorted(best_line, key=lambda word: (float(word[1]), float(word[0])))
+
+
+def _word_lines(words: list[tuple[Any, ...]]) -> list[list[tuple[Any, ...]]]:
     line_map: dict[tuple[int, int], list[tuple[Any, ...]]] = {}
     for word in words:
         key = (int(word[5]), int(word[6]))
         line_map.setdefault(key, []).append(word)
-    return min(
+    return sorted(
         line_map.values(),
-        key=lambda line: abs(_line_center_y(line) - center_y),
+        key=lambda line: (_line_center_y(line), min(float(word[0]) for word in line)),
     )
 
 
@@ -207,6 +218,23 @@ def _line_center_y(words: list[tuple[Any, ...]]) -> float:
         min(float(word[1]) for word in words)
         + max(float(word[3]) for word in words)
     ) / 2
+
+
+def _line_bbox(words: list[tuple[Any, ...]]) -> fitz.Rect:
+    return fitz.Rect(
+        min(float(word[0]) for word in words),
+        min(float(word[1]) for word in words),
+        max(float(word[2]) for word in words),
+        max(float(word[3]) for word in words),
+    )
+
+
+def _vertical_overlap(line_rect: fitz.Rect, link_rect: fitz.Rect) -> float:
+    return max(
+        0.0,
+        min(float(line_rect.y1), float(link_rect.y1) + 3)
+        - max(float(line_rect.y0), float(link_rect.y0) - 3),
+    )
 
 
 def _words_text(words: list[tuple[Any, ...]]) -> str:
@@ -226,37 +254,66 @@ def _parse_candidate_reference(text: str, ordinal: int) -> dict[str, str]:
             break
 
     if id_index >= 0:
-        name_tokens = tokens[:id_index]
+        name_tokens = _candidate_name_tokens(tokens[:id_index])
     else:
-        name_tokens = tokens
+        name_tokens = _candidate_name_tokens(tokens)
 
     candidate_name = _clean_candidate_name(" ".join(name_tokens))
     if not candidate_name:
         candidate_name = f"Candidate {ordinal}"
 
     confidence = "high" if candidate_id else "medium"
+    source_text = " ".join(part for part in (candidate_name, candidate_id) if part)
     return {
         "candidate_name": candidate_name,
         "candidate_id": candidate_id,
+        "source_text": source_text,
         "confidence": confidence,
     }
 
 
+def _candidate_name_tokens(tokens: list[str]) -> list[str]:
+    cut_after = -1
+    for index, token in enumerate(tokens):
+        cleaned = token.strip(",:;()[]{}")
+        if _looks_like_row_marker(cleaned) or _looks_like_candidate_id(cleaned):
+            cut_after = index
+    return tokens[cut_after + 1:]
+
+
 def _clean_row_text(text: str) -> str:
+    cleaned = _strip_leading_row_numbers(text)
     cleaned = re.sub(
         r"\b(candidate\s+name|candidate\s+id|attachments?|resume|pdf)\b",
         " ",
-        text,
+        cleaned,
         flags=re.IGNORECASE,
     )
+    cleaned = _strip_leading_row_numbers(cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip(" -:|")
 
 
 def _clean_candidate_name(value: str) -> str:
-    cleaned = re.sub(r"\s+", " ", value).strip(" -:|")
+    cleaned = _strip_leading_row_numbers(value)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:|")
     cleaned = re.sub(r"\b(view|open|download|attachment)\b", "", cleaned, flags=re.I)
+    cleaned = _strip_leading_row_numbers(cleaned)
     return re.sub(r"\s+", " ", cleaned).strip(" -:|")
+
+
+def _strip_leading_row_numbers(value: str) -> str:
+    cleaned = value.strip()
+    previous = ""
+    while previous != cleaned:
+        previous = cleaned
+        cleaned = re.sub(r"^\s*\d{1,4}\s*[\.)]\s*", "", cleaned)
+        cleaned = re.sub(r"^\s*(?:\d{1,4}\s+){1,8}(?=[A-Z])", "", cleaned)
+    return cleaned
+
+
+def _looks_like_row_marker(token: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,4}[\.)]?", token))
 
 
 def _looks_like_candidate_id(token: str) -> bool:
