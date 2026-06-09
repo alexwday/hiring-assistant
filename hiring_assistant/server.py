@@ -2142,6 +2142,7 @@ def _reviewed_export_html(
     top_rows = []
     lower_rows = []
     ranked_rows = _ranked_review_rows(project, reviewed)
+    column_count = 15 if not static else 12
     for ranked in ranked_rows:
         document = ranked["document"]
         scores = document.get("scores") or {}
@@ -2161,13 +2162,15 @@ def _reviewed_export_html(
         )
         link_cells = _export_link_cells(project_id, document, static)
         row_class = " class=\"top-ten-row\"" if ranked["top_ten"] else ""
+        detail_id = f"candidate-details-{document['id']}"
         row = (
             f"<tr{row_class}>"
             "<td>"
-            "<details class=\"export-details\">"
-            f"<summary>{_h(_document_label(document))}</summary>"
-            f"{details_html}"
-            "</details>"
+            "<button type=\"button\" class=\"details-toggle\" "
+            f"data-details-target=\"{_h(detail_id)}\" "
+            f"aria-controls=\"{_h(detail_id)}\" aria-expanded=\"false\">"
+            f"{_h(_document_label(document))}"
+            "</button>"
             "</td>"
             f"<td>{_h(metadata.get('current_or_recent_title', ''))}</td>"
             f"<td>{_h(metadata.get('current_or_recent_employer', ''))}</td>"
@@ -2182,12 +2185,15 @@ def _reviewed_export_html(
             f"<td>{_h(ranked['recommendation'])}</td>"
             f"{link_cells}"
             "</tr>"
+            f"<tr id=\"{_h(detail_id)}\" "
+            "class=\"candidate-details-row\" hidden>"
+            f"<td colspan=\"{column_count}\">{details_html}</td>"
+            "</tr>"
         )
         if ranked["top_ten"]:
             top_rows.append(row)
         else:
             lower_rows.append(row)
-    column_count = 15 if not static else 12
     if not top_rows and not lower_rows:
         top_rows.append(_empty_row(column_count, "No reviewed resumes."))
     rerank_note = _final_rerank_note(project)
@@ -3038,6 +3044,16 @@ def _interaction_script() -> str:
     <script>
       (() => {
         document.addEventListener("click", event => {
+          const detailsButton = event.target.closest("[data-details-target]");
+          if (detailsButton) {
+            const row = document.getElementById(detailsButton.dataset.detailsTarget);
+            if (!row) return;
+            const willOpen = row.hidden;
+            row.hidden = !willOpen;
+            detailsButton.setAttribute("aria-expanded", String(willOpen));
+            return;
+          }
+
           const button = event.target.closest("[data-select-action]");
           if (!button) return;
           const form = button.closest("form");
@@ -4002,10 +4018,28 @@ def _page(title: str, body: str) -> str:
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 13px;
     }}
-    .export-details summary {{
-      cursor: pointer;
+    .details-toggle {{
+      display: inline;
+      min-height: 0;
+      padding: 0;
       color: var(--accent-dark);
+      background: transparent;
+      border: 0;
+      border-radius: 0;
+      text-align: left;
+      font: inherit;
       font-weight: 800;
+      line-height: 1.35;
+      cursor: pointer;
+    }}
+    .details-toggle:hover {{
+      color: var(--accent);
+      background: transparent;
+      text-decoration: underline;
+    }}
+    .details-toggle:focus {{
+      outline: 2px solid #7dd3c7;
+      outline-offset: 2px;
     }}
     .export-details-body {{
       display: grid;
@@ -4133,6 +4167,19 @@ def _page(title: str, body: str) -> str:
       min-width: 360px;
       max-width: 520px;
       white-space: normal;
+    }}
+    .candidate-details-row td {{
+      padding: 0;
+      background: #ffffff;
+      border-bottom: 2px solid var(--line);
+    }}
+    .candidate-details-row .export-details-body {{
+      width: 100%;
+      min-width: 100%;
+      max-width: none;
+      margin: 0;
+      border: 0;
+      border-radius: 0;
     }}
     .redaction-form {{
       background: var(--surface-soft);

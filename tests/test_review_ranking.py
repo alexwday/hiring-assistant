@@ -167,7 +167,9 @@ def test_reviewed_export_html_has_expandable_rows_and_links(tmp_path):
     html = _reviewed_export_html("project-1", project, documents, store)
 
     assert "Reviewed Results Export" in html
-    assert "<details class=\"export-details\">" in html
+    assert "data-details-target=\"candidate-details-b\"" in html
+    assert "class=\"candidate-details-row\" hidden" in html
+    assert "colspan=\"15\"" in html
     assert "<summary>Job description and screening context</summary>" in html
     assert "<details open>" not in html
     assert "reviewed-export-scroll" in html
@@ -194,4 +196,5 @@ def test_static_reviewed_export_embeds_top_ten_redacted_pdf(tmp_path):
     assert "data:application/pdf;base64," in html
     assert "pdf-pane" in html
     assert "reviewed-export-scroll" in html
+    assert "colspan=\"12\"" in html
     assert "/projects/" not in html
