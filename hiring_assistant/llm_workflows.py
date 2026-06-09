@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 MARKDOWN_PROMPT_VERSION = "resume-page-markdown-v1"
 METADATA_PROMPT_VERSION = "resume-metadata-v1"
-REVIEW_PROMPT_VERSION = "resume-job-review-v2"
+REVIEW_PROMPT_VERSION = "resume-job-review-v3"
 ONE_DECIMAL = Decimal("0.1")
 
 
@@ -246,13 +246,19 @@ class ResumeLLMService:
                     "scores unless the evidence exactly supports them.\n\n"
                     "Required JSON schema:\n"
                     "{\n"
+                    '  "tradeoff_analysis": "",\n'
                     '  "education_summary": "",\n'
+                    '  "education_entries": [\n'
+                    '    {"university": "", "level": "", "completion": "", '
+                    '"program": "", "gpa": "", "fit_summary": ""}\n'
+                    "  ],\n"
                     '  "education_score": 0.0,\n'
                     '  "experience_summary": "",\n'
+                    '  "work_experience_fit_bullets": [],\n'
                     '  "experience_score": 0.0,\n'
                     '  "relevant_projects": [\n'
                     '    {"name": "", "evidence": "", '
-                    '"role_relevance": "", "score": 0.0}\n'
+                    '"role_relevance": "", "summary": "", "score": 0.0}\n'
                     "  ],\n"
                     '  "projects_score": 0.0,\n'
                     '  "unique_standouts": [\n'
@@ -261,16 +267,20 @@ class ResumeLLMService:
                     '  "gaps_and_risks": [\n'
                     '    {"gap": "", "screening_follow_up": "", "severity": ""}\n'
                     "  ],\n"
-                    '  "tradeoff_analysis": "",\n'
                     '  "aggregate_score": 0.0,\n'
                     '  "holistic_score": 0.0,\n'
                     '  "located_in_canada": false,\n'
                     '  "recommendation": "",\n'
                     '  "recommendation_rationale": "",\n'
                     '  "prescreen_email_subject": "",\n'
-                    '  "prescreen_email_body": "",\n'
-                    '  "hiring_manager_notes": []\n'
+                    '  "prescreen_email_body": ""\n'
                     "}\n\n"
+                    "Education entries should be one item per credential. Use the "
+                    "best available non-PII school/program facts only. Completion "
+                    "should be either graduated or years completed in brackets, such "
+                    "as (3 years completed). Work experience fit must be quick bullet "
+                    "points. Relevant projects should have only project name plus a "
+                    "brief summary and role relevance.\n\n"
                     "The prescreen email must be in a fixed, ready-to-send format. "
                     "Questions should be grounded in this candidate's resume and hard "
                     "to answer well with generic AI text: ask for concrete examples, "
@@ -345,23 +355,50 @@ def render_review_markdown(payload: dict[str, Any]) -> str:
         f"- Located in Canada: {_yes_no(payload.get('located_in_canada'))}",
         f"- Recommendation: {payload.get('recommendation', '')}",
         "",
+        "## Tradeoff Analysis",
+        str(payload.get("tradeoff_analysis", "")).strip(),
+        "",
         "## Education Fit",
-        str(payload.get("education_summary", "")).strip(),
-        "",
-        "## Work Experience Fit",
-        str(payload.get("experience_summary", "")).strip(),
-        "",
-        "## Highly Relevant Projects",
     ]
+    education_entries = payload.get("education_entries") or []
+    if education_entries:
+        for entry in education_entries:
+            lines.extend(
+                [
+                    f"### {_education_title(entry)}",
+                    str(entry.get("fit_summary", "")).strip(),
+                    "",
+                ]
+            )
+    else:
+        lines.extend([str(payload.get("education_summary", "")).strip(), ""])
+    lines.extend(
+        [
+            "## Work Experience Fit",
+        ]
+    )
+    work_bullets = payload.get("work_experience_fit_bullets") or []
+    if work_bullets:
+        lines.extend(f"- {bullet}" for bullet in work_bullets)
+    else:
+        lines.append(str(payload.get("experience_summary", "")).strip())
+    lines.extend(
+        [
+            "",
+            "## Highly Relevant Projects",
+        ]
+    )
     projects = payload.get("relevant_projects") or []
     if projects:
         for project in projects:
+            summary = project.get("summary") or project.get("evidence", "")
+            relevance = project.get("role_relevance", "")
             lines.extend(
                 [
                     f"### {project.get('name') or 'Project'}",
                     f"- Score: {_score(project.get('score'))}/10",
-                    f"- Evidence: {project.get('evidence', '')}",
-                    f"- Role relevance: {project.get('role_relevance', '')}",
+                    f"- Summary: {summary}",
+                    f"- Relevance: {relevance}",
                 ]
             )
     else:
@@ -393,13 +430,6 @@ def render_review_markdown(payload: dict[str, Any]) -> str:
     else:
         lines.append("No major gaps were identified.")
 
-    lines.extend(
-        [
-            "",
-            "## Tradeoff Analysis",
-            str(payload.get("tradeoff_analysis", "")).strip(),
-        ]
-    )
     if payload.get("project_recommendation_rationale"):
         lines.extend(
             [
@@ -418,15 +448,8 @@ def render_review_markdown(payload: dict[str, Any]) -> str:
             f"Subject: {payload.get('prescreen_email_subject', '')}",
             "",
             str(payload.get("prescreen_email_body", "")).strip(),
-            "",
-            "## Hiring Manager Notes",
         ]
     )
-    notes = payload.get("hiring_manager_notes") or []
-    if notes:
-        lines.extend(f"- {note}" for note in notes)
-    else:
-        lines.append("- No additional notes.")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -488,6 +511,22 @@ def _normalize_score(value: Any) -> Any:
     if score is None:
         return value
     return float(score.quantize(ONE_DECIMAL, rounding=ROUND_HALF_UP))
+
+
+def _education_title(entry: dict[str, Any]) -> str:
+    university = str(entry.get("university") or "Education").strip()
+    level = str(entry.get("level") or "").strip()
+    completion = str(entry.get("completion") or "").strip()
+    program = str(entry.get("program") or "").strip()
+    gpa = str(entry.get("gpa") or "").strip()
+    parts = [university]
+    if level:
+        parts.append(f"{level} {completion}".strip())
+    if program:
+        parts.append(program)
+    if gpa:
+        parts.append(f"GPA: {gpa}")
+    return " | ".join(parts)
 
 
 def _image_data_url(path: Path) -> str:

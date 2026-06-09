@@ -58,6 +58,19 @@ def test_review_markdown_renders_one_decimal_scores():
             "holistic_score": 9,
             "screening_average": 9.35,
             "located_in_canada": True,
+            "tradeoff_analysis": "Strong execution, lighter formal credentials.",
+            "education_entries": [
+                {
+                    "university": "Example University",
+                    "level": "Bachelor",
+                    "completion": "graduated",
+                    "program": "Information Systems",
+                    "gpa": "3.8",
+                    "fit_summary": "Useful applied systems background.",
+                }
+            ],
+            "work_experience_fit_bullets": ["Led workflow intake redesign."],
+            "hiring_manager_notes": ["This should not render."],
             "recommendation": "Advance to prescreen",
         }
     )
@@ -67,3 +80,10 @@ def test_review_markdown_renders_one_decimal_scores():
     assert "- Relevant projects: 8.0/10" in markdown
     assert "- Screening average: 9.4/10" in markdown
     assert "- Located in Canada: Yes" in markdown
+    assert (
+        "### Example University | Bachelor graduated | "
+        "Information Systems | GPA: 3.8"
+    ) in markdown
+    assert "- Led workflow intake redesign." in markdown
+    assert "Hiring Manager Notes" not in markdown
+    assert "This should not render." not in markdown

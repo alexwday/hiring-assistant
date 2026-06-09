@@ -78,6 +78,14 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                 self._send_html(self._render_project(segments[1], query))
                 return
             if (
+                len(segments) == 4
+                and segments[0] == "projects"
+                and segments[2] == "exports"
+                and segments[3] == "reviewed"
+            ):
+                self._render_reviewed_export(segments[1], query)
+                return
+            if (
                 len(segments) == 3
                 and segments[0] == "projects"
                 and segments[2] == "packages"
@@ -274,6 +282,7 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             if doc.get("status") in {"processing", "reviewing"}
         )
         projects = self.server.store.list_projects()
+        reviewed_export_href = _reviewed_export_href(project_id)
         stats = (
             _stat("Unprocessed", len(uploaded))
             + _stat("Processed", len(processed))
@@ -326,7 +335,12 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
                     <h2>Reviewed Resumes</h2>
                     <p class="muted">Completed job-fit reports and scores.</p>
                   </div>
-                  <span class="count-pill">{len(reviewed)}</span>
+                  <div class="panel-actions">
+                    <a class="secondary-link" href="{reviewed_export_href}">
+                      Export HTML
+                    </a>
+                    <span class="count-pill">{len(reviewed)}</span>
+                  </div>
                 </div>
                 {_reviewed_table(project_id, reviewed)}
               </section>
@@ -533,12 +547,23 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             return
         path = self.server.store.resolve_project_path(project_id, relative)
         text = path.read_text(encoding="utf-8")
-        rendered = _markdown_to_html(text)
         view_label = "Review report" if view == "review" else "Resume markdown"
+        body_class = "review-body" if view == "review" else "markdown-body"
+        if view == "review":
+            payload = _load_review_payload(self.server.store, project_id, document)
+            if payload:
+                _overlay_payload_scores(payload, document)
+                rendered = _review_payload_to_html(payload)
+            else:
+                rendered = _markdown_to_html(text)
+                body_class = "markdown-body"
+        else:
+            rendered = _markdown_to_html(text)
         body = f"""
         <div class="document-shell">
           <nav class="top-nav">
             <a href="/projects/{quote(project_id)}">Back to project</a>
+            <a href="{_reviewed_export_href(project_id)}">Reviewed export</a>
           </nav>
           <article class="document-card">
             <header class="document-header">
@@ -546,11 +571,34 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
               <h1>{_h(title)}</h1>
               <p>{_h(document.get('original_filename', ''))}</p>
             </header>
-            <div class="markdown-body">{rendered}</div>
+            <div class="{body_class}">{rendered}</div>
           </article>
         </div>
         """
         self._send_html(_page(title, body))
+
+    def _render_reviewed_export(
+        self,
+        project_id: str,
+        query: dict[str, list[str]],
+    ) -> None:
+        project = self.server.store.load_project(project_id)
+        reviewed = [
+            document
+            for document in project.get("documents", [])
+            if document.get("status") == "reviewed"
+        ]
+        html_payload = _reviewed_export_html(
+            project_id,
+            project,
+            reviewed,
+            self.server.store,
+        )
+        if _first(query, "download"):
+            filename = f"{project_id}-reviewed-results.html"
+            self._send_download_html(html_payload, filename)
+            return
+        self._send_html(html_payload)
 
     def _render_pii_review(self, project_id: str, document_id: str) -> None:
         project = self.server.store.load_project(project_id)
@@ -1298,6 +1346,18 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_download_html(self, payload: str, filename: str) -> None:
+        encoded = payload.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename={filename}",
+        )
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
     def _not_found(self) -> None:
         self._send_error_page(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -1465,6 +1525,9 @@ def _project_sidebar(
           </a>
           <a class="side-tool" href="/projects/{quote(active_project_id)}/packages">
             Package splitter
+          </a>
+          <a class="side-tool" href="{_reviewed_export_href(active_project_id)}">
+            Reviewed export
           </a>
         </div>
         """
@@ -1822,6 +1885,408 @@ def _reviewed_table(project_id: str, documents: list[dict[str, Any]]) -> str:
     """
 
 
+def _reviewed_export_html(
+    project_id: str,
+    project: dict[str, Any],
+    reviewed: list[dict[str, Any]],
+    store: ProjectStore,
+) -> str:
+    rows = []
+    for ranked in _rank_reviewed_documents(reviewed):
+        document = ranked["document"]
+        scores = document.get("scores") or {}
+        payload = _load_review_payload(store, project_id, document)
+        if payload:
+            _overlay_payload_scores(payload, document)
+        resume_href = _document_file_href(project_id, document["id"])
+        report_href = _document_view_href(project_id, document["id"], "review")
+        markdown_href = _document_view_href(project_id, document["id"], "markdown")
+        rows.append(
+            "<tr>"
+            "<td>"
+            "<details class=\"export-details\">"
+            f"<summary>{_h(_document_label(document))}</summary>"
+            f"{_export_candidate_summary_html(payload)}"
+            "</details>"
+            "</td>"
+            f"<td class=\"flag-cell\">{_canada_flag(scores)}</td>"
+            f"<td>{_h(ranked['rank'])}</td>"
+            f"<td>{_h(_score(scores.get('aggregate')))}</td>"
+            f"<td>{_h(_score(scores.get('holistic')))}</td>"
+            f"<td>{_h(_score(ranked['average']))}</td>"
+            f"<td>{_h(ranked['recommendation'])}</td>"
+            f"<td><a href=\"{resume_href}\">Resume PDF</a></td>"
+            f"<td><a href=\"{report_href}\">Report</a></td>"
+            f"<td><a href=\"{markdown_href}\">Markdown</a></td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append(_empty_row(10, "No reviewed resumes."))
+    body = f"""
+    <div class="document-shell export-shell">
+      <nav class="top-nav">
+        <a href="/projects/{quote(project_id)}">Back to project</a>
+        <a href="{_reviewed_export_href(project_id, download=True)}">
+          Download HTML
+        </a>
+      </nav>
+      <article class="document-card">
+        <header class="document-header">
+          <span class="eyebrow">Reviewed Results Export</span>
+          <h1>{_h(project.get('name', project_id))}</h1>
+          <p>
+            Ranked reviewed resumes with expandable screening details and links
+            to each resume, report, and markdown extract.
+          </p>
+        </header>
+        <div class="export-body">
+          <table class="reviewed-export-table">
+            <thead>
+              <tr>
+                <th>Candidate</th><th>Canada</th><th>Rank</th>
+                <th>Aggregate</th><th>Holistic</th><th>Avg</th>
+                <th>Recommendation</th><th>Resume</th><th>Report</th>
+                <th>Markdown</th>
+              </tr>
+            </thead>
+            <tbody>{''.join(rows)}</tbody>
+          </table>
+        </div>
+      </article>
+    </div>
+    """
+    return _page(f"Reviewed Export: {project.get('name', project_id)}", body)
+
+
+def _load_review_payload(
+    store: ProjectStore,
+    project_id: str,
+    document: dict[str, Any],
+) -> dict[str, Any]:
+    review_json_rel = document.get("review_json_path")
+    if not review_json_rel:
+        return {}
+    try:
+        path = store.resolve_project_path(project_id, review_json_rel)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _overlay_payload_scores(
+    payload: dict[str, Any],
+    document: dict[str, Any],
+) -> None:
+    scores = document.get("scores") or {}
+    score_keys = {
+        "education": "education_score",
+        "experience": "experience_score",
+        "projects": "projects_score",
+        "aggregate": "aggregate_score",
+        "holistic": "holistic_score",
+    }
+    for score_key, payload_key in score_keys.items():
+        if score_key in scores:
+            payload[payload_key] = scores[score_key]
+    for key in (
+        "screening_average",
+        "project_rank",
+        "located_in_canada",
+        "recommendation",
+    ):
+        if key in scores:
+            payload[key] = scores[key]
+
+
+def _review_payload_to_html(payload: dict[str, Any]) -> str:
+    return (
+        _score_dashboard_html(payload)
+        + _tradeoff_html(payload)
+        + _education_fit_html(payload)
+        + _work_experience_fit_html(payload)
+        + _project_fit_html(payload)
+        + _standout_gap_grid_html(payload)
+        + _project_rank_recommendation_html(payload)
+        + _prescreen_email_html(payload)
+    )
+
+
+def _score_dashboard_html(payload: dict[str, Any]) -> str:
+    tiles = [
+        _score_tile("Education", payload.get("education_score")),
+        _score_tile("Experience", payload.get("experience_score")),
+        _score_tile("Projects", payload.get("projects_score")),
+        _score_tile("Aggregate", payload.get("aggregate_score")),
+        _score_tile("Holistic", payload.get("holistic_score")),
+        _score_tile("Avg", payload.get("screening_average")),
+        _text_tile("Rank", _rank_label(payload.get("project_rank"))),
+        _text_tile(
+            "Canada",
+            "Yes" if _boolish(payload.get("located_in_canada")) else "No",
+        ),
+        _text_tile("Recommendation", payload.get("recommendation", "")),
+    ]
+    return f"""
+    <section class="review-section">
+      <div class="score-dashboard">{''.join(tiles)}</div>
+    </section>
+    """
+
+
+def _score_tile(label: str, value: Any) -> str:
+    score = _score(value) or "N/A"
+    return (
+        "<div class=\"score-tile\">"
+        f"<span>{_h(label)}</span>"
+        f"<strong>{_h(score)}</strong>"
+        "<small>/10</small>"
+        "</div>"
+    )
+
+
+def _text_tile(label: str, value: Any) -> str:
+    text = str(value or "N/A")
+    return (
+        "<div class=\"score-tile text-tile\">"
+        f"<span>{_h(label)}</span>"
+        f"<strong>{_h(text)}</strong>"
+        "</div>"
+    )
+
+
+def _tradeoff_html(payload: dict[str, Any]) -> str:
+    tradeoff = str(payload.get("tradeoff_analysis") or "").strip()
+    if not tradeoff:
+        return ""
+    return f"""
+    <section class="review-section tradeoff-summary">
+      <h2>Tradeoff Analysis</h2>
+      <p>{_h(tradeoff)}</p>
+    </section>
+    """
+
+
+def _education_fit_html(payload: dict[str, Any]) -> str:
+    entries = payload.get("education_entries") or []
+    if entries:
+        rendered = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            rendered.append(
+                "<article class=\"education-entry\">"
+                f"<h3>{_h(_education_entry_title(entry))}</h3>"
+                f"<p>{_h(str(entry.get('fit_summary') or '').strip())}</p>"
+                "</article>"
+            )
+        if rendered:
+            return f"""
+            <section class="review-section">
+              <h2>Education Fit</h2>
+              {''.join(rendered)}
+            </section>
+            """
+    summary = str(payload.get("education_summary") or "").strip()
+    return f"""
+    <section class="review-section">
+      <h2>Education Fit</h2>
+      <p>{_h(summary or 'No education fit summary was provided.')}</p>
+    </section>
+    """
+
+
+def _education_entry_title(entry: dict[str, Any]) -> str:
+    university = str(entry.get("university") or "Education").strip()
+    level = str(entry.get("level") or "").strip()
+    completion = str(entry.get("completion") or "").strip()
+    program = str(entry.get("program") or "").strip()
+    gpa = str(entry.get("gpa") or "").strip()
+    parts = [university]
+    if level:
+        parts.append(f"{level} {completion}".strip())
+    if program:
+        parts.append(program)
+    if gpa:
+        parts.append(f"GPA: {gpa}")
+    return " | ".join(parts)
+
+
+def _work_experience_fit_html(payload: dict[str, Any]) -> str:
+    bullets = _text_list(payload.get("work_experience_fit_bullets"))
+    if not bullets:
+        summary = str(payload.get("experience_summary") or "").strip()
+        bullets = [summary] if summary else []
+    return f"""
+    <section class="review-section">
+      <h2>Work Experience Fit</h2>
+      {_bullet_list_html(bullets, 'No work experience fit summary was provided.')}
+    </section>
+    """
+
+
+def _project_fit_html(payload: dict[str, Any]) -> str:
+    projects = payload.get("relevant_projects") or []
+    rendered = []
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        name = str(project.get("name") or "Project").strip()
+        summary = str(project.get("summary") or project.get("evidence") or "").strip()
+        relevance = str(project.get("role_relevance") or "").strip()
+        details = " ".join(part for part in (summary, relevance) if part)
+        rendered.append(
+            "<article class=\"project-entry\">"
+            f"<h3>{_h(name)}</h3>"
+            f"<p>{_h(details)}</p>"
+            "</article>"
+        )
+    if not rendered:
+        rendered.append("<p>No highly relevant projects were identified.</p>")
+    return f"""
+    <section class="review-section">
+      <h2>Highly Relevant Projects</h2>
+      {''.join(rendered)}
+    </section>
+    """
+
+
+def _standout_gap_grid_html(payload: dict[str, Any]) -> str:
+    standouts = [
+        text
+        for text in (
+            _standout_text(item)
+            for item in payload.get("unique_standouts") or []
+        )
+        if text
+    ]
+    gaps = [
+        text
+        for text in (
+            _gap_text(item) for item in payload.get("gaps_and_risks") or []
+        )
+        if text
+    ]
+    standout_html = _bullet_list_html(
+        standouts,
+        "No unique standout signals identified.",
+    )
+    gap_html = _bullet_list_html(gaps, "No major gaps identified.")
+    return f"""
+    <section class="review-section">
+      <table class="standout-risk-table">
+        <thead>
+          <tr>
+            <th>Unique Standout Signals</th>
+            <th>Gaps, Risks, And Follow-Ups</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>{standout_html}</td>
+            <td>{gap_html}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+    """
+
+
+def _project_rank_recommendation_html(payload: dict[str, Any]) -> str:
+    rationale = str(payload.get("project_recommendation_rationale") or "").strip()
+    if not rationale:
+        rationale = str(payload.get("recommendation_rationale") or "").strip()
+    if not rationale:
+        return ""
+    return f"""
+    <section class="review-section">
+      <h2>Recommendation Rationale</h2>
+      <p>{_h(rationale)}</p>
+    </section>
+    """
+
+
+def _prescreen_email_html(payload: dict[str, Any]) -> str:
+    subject = str(payload.get("prescreen_email_subject") or "").strip()
+    body = str(payload.get("prescreen_email_body") or "").strip()
+    if not subject and not body:
+        return ""
+    return f"""
+    <section class="review-section prescreen-email">
+      <h2>Prescreen Email</h2>
+      <p><strong>Subject:</strong> {_h(subject)}</p>
+      <pre>{_h(body)}</pre>
+    </section>
+    """
+
+
+def _export_candidate_summary_html(payload: dict[str, Any]) -> str:
+    if not payload:
+        return (
+            "<div class=\"export-details-body\">"
+            "<p>No review payload found.</p>"
+            "</div>"
+        )
+    return (
+        "<div class=\"export-details-body\">"
+        + _tradeoff_html(payload)
+        + _education_fit_html(payload)
+        + _work_experience_fit_html(payload)
+        + _project_fit_html(payload)
+        + "</div>"
+    )
+
+
+def _text_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _bullet_list_html(items: list[str], empty: str) -> str:
+    if not items:
+        return f"<p class=\"muted\">{_h(empty)}</p>"
+    return "<ul>" + "".join(f"<li>{_h(item)}</li>" for item in items) + "</ul>"
+
+
+def _standout_text(item: Any) -> str:
+    if not isinstance(item, dict):
+        return str(item).strip()
+    signal = str(item.get("signal") or "").strip()
+    why = str(item.get("why_it_matters") or "").strip()
+    confidence = str(item.get("confidence") or "").strip()
+    text = ": ".join(part for part in (signal, why) if part)
+    if confidence:
+        text = f"{text} (confidence: {confidence})" if text else confidence
+    return text
+
+
+def _gap_text(item: Any) -> str:
+    if not isinstance(item, dict):
+        return str(item).strip()
+    gap = str(item.get("gap") or "").strip()
+    follow_up = str(item.get("screening_follow_up") or "").strip()
+    severity = str(item.get("severity") or "").strip()
+    pieces = []
+    if gap:
+        pieces.append(gap)
+    if severity:
+        pieces.append(f"Severity: {severity}")
+    if follow_up:
+        pieces.append(f"Follow-up: {follow_up}")
+    return ". ".join(pieces)
+
+
+def _rank_label(value: Any) -> str:
+    try:
+        rank = int(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"#{rank}"
+
+
 def _rerank_reviewed_recommendations(
     store: ProjectStore,
     project_id: str,
@@ -2169,6 +2634,17 @@ def _document_view_href(project_id: str, document_id: str, view: str) -> str:
     )
 
 
+def _document_file_href(project_id: str, document_id: str) -> str:
+    return f"/projects/{quote(project_id)}/files/{quote(document_id)}"
+
+
+def _reviewed_export_href(project_id: str, download: bool = False) -> str:
+    href = f"/projects/{quote(project_id)}/exports/reviewed"
+    if download:
+        return href + "?" + urlencode({"download": "1"})
+    return href
+
+
 def _status_label(status: str) -> str:
     labels = {
         "uploaded": "Needs PII review",
@@ -2497,6 +2973,13 @@ def _page(title: str, body: str) -> str:
       margin: 0;
       font-size: 13px;
     }}
+    .panel-actions {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
     .count-pill {{
       min-width: 34px;
       height: 28px;
@@ -2565,6 +3048,22 @@ def _page(title: str, body: str) -> str:
     }}
     .secondary-button:hover {{
       background: #d9f7f0;
+    }}
+    .secondary-link {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 7px 10px;
+      color: var(--accent-dark);
+      background: #ecfdf9;
+      border: 1px solid #a7e3d8;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 800;
+    }}
+    .secondary-link:hover {{
+      text-decoration: none;
+      border-color: var(--accent);
     }}
     table {{
       width: 100%;
@@ -2691,6 +3190,9 @@ def _page(title: str, body: str) -> str:
       display: grid;
       gap: 14px;
     }}
+    .export-shell {{
+      width: min(1480px, 100%);
+    }}
     .top-nav a {{
       display: inline-flex;
       align-items: center;
@@ -2780,6 +3282,126 @@ def _page(title: str, body: str) -> str:
       border-radius: 4px;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 0.92em;
+    }}
+    .review-body,
+    .export-body {{
+      display: grid;
+      gap: 18px;
+      padding: 24px 28px 32px;
+      line-height: 1.5;
+      font-size: 15px;
+    }}
+    .review-section {{
+      display: grid;
+      gap: 10px;
+    }}
+    .review-section h2 {{
+      margin: 0;
+      padding-bottom: 7px;
+      border-bottom: 1px solid var(--line);
+      font-size: 18px;
+    }}
+    .review-section h3 {{
+      margin: 0 0 4px;
+      font-size: 15px;
+    }}
+    .review-section p {{
+      margin: 0;
+    }}
+    .score-dashboard {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));
+      gap: 10px;
+    }}
+    .score-tile {{
+      min-height: 92px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+    }}
+    .score-tile span {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }}
+    .score-tile strong {{
+      display: inline-block;
+      margin-top: 7px;
+      font-size: 28px;
+      line-height: 1;
+    }}
+    .score-tile small {{
+      margin-left: 3px;
+      color: var(--muted);
+      font-weight: 800;
+    }}
+    .text-tile {{
+      min-width: 170px;
+    }}
+    .text-tile strong {{
+      font-size: 17px;
+      line-height: 1.25;
+    }}
+    .tradeoff-summary {{
+      padding: 14px;
+      border: 1px solid #a7e3d8;
+      border-radius: 8px;
+      background: #ecfdf9;
+    }}
+    .education-entry,
+    .project-entry {{
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+    }}
+    .standout-risk-table ul,
+    .review-section ul {{
+      margin: 0 0 0 18px;
+      padding: 0;
+    }}
+    .standout-risk-table li,
+    .review-section li {{
+      margin: 6px 0;
+    }}
+    .standout-risk-table td {{
+      width: 50%;
+    }}
+    .prescreen-email pre {{
+      margin: 0;
+      padding: 12px;
+      overflow: auto;
+      white-space: pre-wrap;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+    }}
+    .export-details summary {{
+      cursor: pointer;
+      color: var(--accent-dark);
+      font-weight: 800;
+    }}
+    .export-details-body {{
+      display: grid;
+      gap: 14px;
+      min-width: 620px;
+      max-width: 900px;
+      margin-top: 12px;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+    }}
+    .export-details-body .tradeoff-summary {{
+      background: #ffffff;
+    }}
+    .reviewed-export-table td:first-child {{
+      min-width: 260px;
     }}
     .redaction-form {{
       background: var(--surface-soft);
