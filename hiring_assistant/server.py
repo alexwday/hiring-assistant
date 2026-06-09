@@ -10,6 +10,7 @@ import os
 import re
 import threading
 import webbrowser
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email import policy
 from email.parser import BytesParser
 from http import HTTPStatus
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
-from hiring_assistant.llm_workflows import ResumeLLMService
+from hiring_assistant.llm_workflows import ResumeLLMService, render_review_markdown
 from hiring_assistant.package_splitter import (
     analyze_resume_package,
     split_resume_package,
@@ -35,6 +36,10 @@ from utilities.logging_setup import setup_logging
 from utilities.ssl_setup import SSLSetupResult, setup_ssl
 
 logger = logging.getLogger(__name__)
+
+ADVANCE_RECOMMENDATION = "Advance to prescreen"
+HOLD_RECOMMENDATION = "Hold after top six"
+ONE_DECIMAL = Decimal("0.1")
 
 
 class HiringAssistantHTTPServer(ThreadingHTTPServer):
@@ -1260,6 +1265,7 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             review_error="",
             prompt_versions=prompt_versions,
         )
+        _rerank_reviewed_recommendations(self.server.store, project_id)
 
     def _parse_post(self) -> tuple[dict[str, list[str]], list[UploadedFile]]:
         content_type = self.headers.get("Content-Type", "")
@@ -1732,35 +1738,178 @@ def _processed_table(project_id: str, documents: list[dict[str, Any]]) -> str:
     """
 
 
+def _rank_reviewed_documents(
+    documents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ranked: list[tuple[dict[str, Any], float | None, float | None, float | None]] = []
+    for document in documents:
+        scores = document.get("scores") or {}
+        average = _screening_average(scores)
+        ranked.append(
+            (
+                document,
+                average,
+                _numeric_score(scores.get("aggregate")),
+                _numeric_score(scores.get("holistic")),
+            )
+        )
+
+    ranked.sort(
+        key=lambda item: (
+            item[1] is not None,
+            item[1] if item[1] is not None else -1.0,
+            item[2] if item[2] is not None else -1.0,
+            item[3] if item[3] is not None else -1.0,
+            str(item[0].get("reviewed_at") or ""),
+            str(item[0].get("id") or ""),
+        ),
+        reverse=True,
+    )
+    result = []
+    for rank, (document, average, _aggregate, _holistic) in enumerate(
+        ranked,
+        start=1,
+    ):
+        recommendation = (
+            ADVANCE_RECOMMENDATION
+            if rank <= 6 and average is not None
+            else HOLD_RECOMMENDATION
+        )
+        result.append(
+            {
+                "document": document,
+                "rank": rank,
+                "average": average,
+                "recommendation": recommendation,
+            }
+        )
+    return result
+
+
 def _reviewed_table(project_id: str, documents: list[dict[str, Any]]) -> str:
     rows = []
-    for document in documents:
+    for ranked in _rank_reviewed_documents(documents):
+        document = ranked["document"]
         scores = document.get("scores") or {}
         review_href = _document_view_href(project_id, document["id"], "review")
         markdown_href = _document_view_href(project_id, document["id"], "markdown")
         rows.append(
             "<tr>"
             f"<td>{_candidate_label(project_id, document)}</td>"
+            f"<td class=\"flag-cell\">{_canada_flag(scores)}</td>"
+            f"<td>{_h(ranked['rank'])}</td>"
             f"<td>{_h(_score(scores.get('aggregate')))}</td>"
             f"<td>{_h(_score(scores.get('holistic')))}</td>"
-            f"<td>{_h(scores.get('recommendation', ''))}</td>"
+            f"<td>{_h(_score(ranked['average']))}</td>"
+            f"<td>{_h(ranked['recommendation'])}</td>"
             f"<td><a href=\"{review_href}\">Review</a></td>"
             f"<td><a href=\"{markdown_href}\">Markdown</a></td>"
             "</tr>"
         )
     if not rows:
-        rows.append(_empty_row(6, "No reviewed resumes."))
+        rows.append(_empty_row(9, "No reviewed resumes."))
     return f"""
     <table>
       <thead>
         <tr>
-          <th>Candidate</th><th>Aggregate</th><th>Holistic</th>
+          <th>Candidate</th><th>Canada</th><th>Rank</th>
+          <th>Aggregate</th><th>Holistic</th><th>Avg</th>
           <th>Recommendation</th><th>Report</th><th>Markdown</th>
         </tr>
       </thead>
       <tbody>{''.join(rows)}</tbody>
     </table>
     """
+
+
+def _rerank_reviewed_recommendations(
+    store: ProjectStore,
+    project_id: str,
+) -> None:
+    project = store.load_project(project_id)
+    reviewed = [
+        document
+        for document in project.get("documents", [])
+        if document.get("status") == "reviewed"
+    ]
+    ranked_documents = _rank_reviewed_documents(reviewed)
+    total = len(ranked_documents)
+    for ranked in ranked_documents:
+        document = ranked["document"]
+        scores = dict(document.get("scores") or {})
+        scores["screening_average"] = ranked["average"]
+        scores["project_rank"] = ranked["rank"]
+        scores["recommendation"] = ranked["recommendation"]
+        scores["located_in_canada"] = _boolish(scores.get("located_in_canada"))
+        document["scores"] = scores
+        _update_review_artifacts(store, project_id, document, ranked, total)
+    if ranked_documents:
+        store.save_project(project)
+
+
+def _update_review_artifacts(
+    store: ProjectStore,
+    project_id: str,
+    document: dict[str, Any],
+    ranked: dict[str, Any],
+    total: int,
+) -> None:
+    review_json_rel = document.get("review_json_path")
+    if not review_json_rel:
+        return
+    try:
+        review_json_path = store.resolve_project_path(project_id, review_json_rel)
+        payload = json.loads(review_json_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return
+        scores = document.get("scores") or {}
+        payload["screening_average"] = scores.get("screening_average")
+        payload["project_rank"] = scores.get("project_rank")
+        payload["located_in_canada"] = scores.get("located_in_canada", False)
+        payload["recommendation"] = scores.get("recommendation", "")
+        payload["project_recommendation_rationale"] = (
+            _project_recommendation_rationale(ranked, total)
+        )
+        store.write_project_json(project_id, review_json_rel, payload)
+
+        review_markdown_rel = document.get("review_markdown_path")
+        if review_markdown_rel:
+            store.write_project_text(
+                project_id,
+                review_markdown_rel,
+                render_review_markdown(payload),
+            )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.warning(
+            "Unable to update review artifacts for %s: %s",
+            document.get("id"),
+            exc,
+        )
+
+
+def _project_recommendation_rationale(
+    ranked: dict[str, Any],
+    total: int,
+) -> str:
+    rank = ranked["rank"]
+    average = ranked["average"]
+    recommendation = ranked["recommendation"]
+    if average is None:
+        return (
+            "This candidate is held because the aggregate and holistic scores "
+            "needed for project ranking are not both available."
+        )
+    if recommendation == ADVANCE_RECOMMENDATION:
+        return (
+            f"Ranked {rank} of {total} reviewed resumes in this project by the "
+            "average of aggregate and holistic scores "
+            f"({_score(average)}/10), which is inside the top 6 available."
+        )
+    return (
+        f"Ranked {rank} of {total} reviewed resumes in this project by the "
+        "average of aggregate and holistic scores "
+        f"({_score(average)}/10), which is outside the top 6 available."
+    )
 
 
 def _empty_row(columns: int, message: str) -> str:
@@ -2441,6 +2590,15 @@ def _page(title: str, body: str) -> str:
       letter-spacing: 0;
     }}
     tr:last-child td {{ border-bottom: 0; }}
+    .flag-cell {{
+      width: 74px;
+      text-align: center;
+      white-space: nowrap;
+    }}
+    .canada-flag {{
+      font-size: 18px;
+      line-height: 1;
+    }}
     .table-action {{
       display: flex;
       justify-content: flex-end;
@@ -2810,13 +2968,58 @@ def _format_ts(value: str) -> str:
     return value.replace("T", " ").replace("+00:00", " UTC")
 
 
+def _numeric_score(value: Any) -> float | None:
+    score = _decimal_score(value)
+    if score is None:
+        return None
+    return float(score)
+
+
+def _screening_average(scores: dict[str, Any]) -> float | None:
+    aggregate = _decimal_score(scores.get("aggregate"))
+    holistic = _decimal_score(scores.get("holistic"))
+    if aggregate is None or holistic is None:
+        return None
+    average = (aggregate + holistic) / Decimal("2")
+    return float(average.quantize(ONE_DECIMAL, rounding=ROUND_HALF_UP))
+
+
+def _decimal_score(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        score = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return score if score.is_finite() else None
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "canada"}
+    return False
+
+
+def _canada_flag(scores: dict[str, Any]) -> str:
+    if not _boolish(scores.get("located_in_canada")):
+        return ""
+    return (
+        "<span class=\"canada-flag\" title=\"Located in Canada\" "
+        "aria-label=\"Located in Canada\">&#x1F1E8;&#x1F1E6;</span>"
+    )
+
+
 def _score(value: Any) -> str:
     if value in (None, ""):
         return ""
-    try:
-        return f"{float(value):.1f}".rstrip("0").rstrip(".")
-    except (TypeError, ValueError):
+    score = _decimal_score(value)
+    if score is None:
         return str(value)
+    return str(score.quantize(ONE_DECIMAL, rounding=ROUND_HALF_UP))
 
 
 def _parse_positive_int(value: str, default: int) -> int:

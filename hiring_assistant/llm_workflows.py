@@ -7,6 +7,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,8 @@ logger = logging.getLogger(__name__)
 
 MARKDOWN_PROMPT_VERSION = "resume-page-markdown-v1"
 METADATA_PROMPT_VERSION = "resume-metadata-v1"
-REVIEW_PROMPT_VERSION = "resume-job-review-v1"
+REVIEW_PROMPT_VERSION = "resume-job-review-v2"
+ONE_DECIMAL = Decimal("0.1")
 
 
 @dataclass(frozen=True)
@@ -101,12 +103,18 @@ class ResumeLLMService:
             client.close()
 
         report = render_review_markdown(payload)
+        screening_average = _screening_average(
+            payload.get("aggregate_score"),
+            payload.get("holistic_score"),
+        )
         scores = {
             "education": payload.get("education_score"),
             "experience": payload.get("experience_score"),
             "projects": payload.get("projects_score"),
             "aggregate": payload.get("aggregate_score"),
             "holistic": payload.get("holistic_score"),
+            "screening_average": screening_average,
+            "located_in_canada": _boolish(payload.get("located_in_canada")),
             "recommendation": payload.get("recommendation"),
         }
         return ResumeReview(
@@ -232,19 +240,21 @@ class ResumeLLMService:
                 "role": "user",
                 "content": (
                     "Review this candidate against the job posting. Return JSON with "
-                    "the exact fields listed below. Scores are 0-10, where 10 is an "
-                    "exceptional match.\n\n"
+                    "the exact fields listed below. Scores are 0.0-10.0, where 10.0 "
+                    "is an exceptional match. Use one decimal place for every score "
+                    "(for example 8.6 or 9.7), and do not default to whole-number "
+                    "scores unless the evidence exactly supports them.\n\n"
                     "Required JSON schema:\n"
                     "{\n"
                     '  "education_summary": "",\n'
-                    '  "education_score": 0,\n'
+                    '  "education_score": 0.0,\n'
                     '  "experience_summary": "",\n'
-                    '  "experience_score": 0,\n'
+                    '  "experience_score": 0.0,\n'
                     '  "relevant_projects": [\n'
                     '    {"name": "", "evidence": "", '
-                    '"role_relevance": "", "score": 0}\n'
+                    '"role_relevance": "", "score": 0.0}\n'
                     "  ],\n"
-                    '  "projects_score": 0,\n'
+                    '  "projects_score": 0.0,\n'
                     '  "unique_standouts": [\n'
                     '    {"signal": "", "why_it_matters": "", "confidence": ""}\n'
                     "  ],\n"
@@ -252,8 +262,9 @@ class ResumeLLMService:
                     '    {"gap": "", "screening_follow_up": "", "severity": ""}\n'
                     "  ],\n"
                     '  "tradeoff_analysis": "",\n'
-                    '  "aggregate_score": 0,\n'
-                    '  "holistic_score": 0,\n'
+                    '  "aggregate_score": 0.0,\n'
+                    '  "holistic_score": 0.0,\n'
+                    '  "located_in_canada": false,\n'
                     '  "recommendation": "",\n'
                     '  "recommendation_rationale": "",\n'
                     '  "prescreen_email_subject": "",\n'
@@ -265,6 +276,12 @@ class ResumeLLMService:
                     "to answer well with generic AI text: ask for concrete examples, "
                     "specific tradeoffs, implementation details, numbers, decisions, "
                     "or lessons learned.\n\n"
+                    "Set located_in_canada to true only when the resume explicitly "
+                    "indicates the candidate is Canada-based. Store only the boolean; "
+                    "do not include city, address, postal code, email, phone, URLs, "
+                    "or the candidate name anywhere in the response. The app will "
+                    "assign the final advance/hold recommendation later by ranking "
+                    "all reviewed candidates in this project.\n\n"
                     f"Candidate metadata:\n{json.dumps(metadata, indent=2)}\n\n"
                     f"Job posting:\n{job_posting}\n\n"
                     f"Additional work context:\n{work_context or '(none provided)'}\n\n"
@@ -282,7 +299,7 @@ class ResumeLLMService:
         )
         text = extract_message_text(response)
         payload = parse_json_object(text)
-        return _remove_pii_metadata(payload)
+        return _normalize_review_payload(_remove_pii_metadata(payload))
 
     def _combine_page_markdown(
         self,
@@ -324,6 +341,8 @@ def render_review_markdown(payload: dict[str, Any]) -> str:
         f"- Relevant projects: {_score(payload.get('projects_score'))}/10",
         f"- Aggregate score: {_score(payload.get('aggregate_score'))}/10",
         f"- Holistic judgment score: {_score(payload.get('holistic_score'))}/10",
+        f"- Screening average: {_score(payload.get('screening_average'))}/10",
+        f"- Located in Canada: {_yes_no(payload.get('located_in_canada'))}",
         f"- Recommendation: {payload.get('recommendation', '')}",
         "",
         "## Education Fit",
@@ -379,6 +398,18 @@ def render_review_markdown(payload: dict[str, Any]) -> str:
             "",
             "## Tradeoff Analysis",
             str(payload.get("tradeoff_analysis", "")).strip(),
+        ]
+    )
+    if payload.get("project_recommendation_rationale"):
+        lines.extend(
+            [
+                "",
+                "## Project Rank Recommendation",
+                str(payload.get("project_recommendation_rationale", "")).strip(),
+            ]
+        )
+    lines.extend(
+        [
             "",
             "## Recommendation Rationale",
             str(payload.get("recommendation_rationale", "")).strip(),
@@ -418,15 +449,89 @@ def _remove_pii_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key not in pii_keys}
 
 
+def _normalize_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize review score precision and boolean-only location signal."""
+    normalized = dict(payload)
+    for key in (
+        "education_score",
+        "experience_score",
+        "projects_score",
+        "aggregate_score",
+        "holistic_score",
+    ):
+        if key in normalized:
+            normalized[key] = _normalize_score(normalized[key])
+
+    projects = normalized.get("relevant_projects")
+    if isinstance(projects, list):
+        normalized_projects = []
+        for project in projects:
+            if isinstance(project, dict):
+                project = dict(project)
+                if "score" in project:
+                    project["score"] = _normalize_score(project["score"])
+            normalized_projects.append(project)
+        normalized["relevant_projects"] = normalized_projects
+
+    normalized["located_in_canada"] = _boolish(
+        normalized.get("located_in_canada", False)
+    )
+    normalized["screening_average"] = _screening_average(
+        normalized.get("aggregate_score"),
+        normalized.get("holistic_score"),
+    )
+    return normalized
+
+
+def _normalize_score(value: Any) -> Any:
+    score = _decimal_score(value)
+    if score is None:
+        return value
+    return float(score.quantize(ONE_DECIMAL, rounding=ROUND_HALF_UP))
+
+
 def _image_data_url(path: Path) -> str:
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:image/png;base64,{encoded}"
 
 
+def _screening_average(aggregate: Any, holistic: Any) -> float | None:
+    aggregate_score = _decimal_score(aggregate)
+    holistic_score = _decimal_score(holistic)
+    if aggregate_score is None or holistic_score is None:
+        return None
+    average = (aggregate_score + holistic_score) / Decimal("2")
+    return float(average.quantize(ONE_DECIMAL, rounding=ROUND_HALF_UP))
+
+
+def _decimal_score(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        score = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return score if score.is_finite() else None
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "canada"}
+    return False
+
+
+def _yes_no(value: Any) -> str:
+    return "Yes" if _boolish(value) else "No"
+
+
 def _score(value: Any) -> str:
     if value in (None, ""):
         return ""
-    try:
-        return f"{float(value):.1f}".rstrip("0").rstrip(".")
-    except (TypeError, ValueError):
+    score = _decimal_score(value)
+    if score is None:
         return str(value)
+    return str(score.quantize(ONE_DECIMAL, rounding=ROUND_HALF_UP))
