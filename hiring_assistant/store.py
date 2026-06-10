@@ -64,6 +64,7 @@ class UploadedFile:
 
     filename: str
     content: bytes
+    field_name: str = ""
 
 
 class ProjectStore:

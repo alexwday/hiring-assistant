@@ -25,6 +25,18 @@ http://127.0.0.1:8000
 The browser opens automatically unless `APP_OPEN_BROWSER=false` is set or
 `--no-open-browser` is passed.
 
+The interview-time assistant is available at:
+
+```text
+http://127.0.0.1:8000/interview
+```
+
+There is also a native Python interview app:
+
+```bash
+python interview_app.py
+```
+
 ## Workflow
 
 1. Create a project for one posting.
@@ -35,6 +47,53 @@ The browser opens automatically unless `APP_OPEN_BROWSER=false` is set or
 6. Process redacted resumes into LLM-readable markdown with non-contact metadata.
 7. Select processed resumes for job-fit review.
 8. Review the generated hiring-manager report and prescreen email template.
+
+## Browser Interview Assistant
+
+The separate `/interview` app lets you paste or upload a job posting, optional
+context notes, and one candidate resume. It generates large-format cue cards for
+openers, topics, follow-ups, transitions, watchouts, and closing prompts.
+
+For live interviews, prefer the native app below. Browser audio capture requires
+browser media permissions and cannot reliably capture system meeting audio
+without a screen/tab sharing picker.
+
+## Native Interview App
+
+`python interview_app.py` launches a PySide6 desktop version of the same
+interview assistant. It uses `sounddevice` to capture selected local input
+devices, mixes them into 16 kHz mono audio, and transcribes locally with
+OpenAI's open-source Whisper package. No audio is sent to the OpenAI
+transcription endpoint.
+
+On first start, the app downloads the configured local Whisper model into:
+
+```text
+data/models/whisper/
+```
+
+The default model is `base.en`. Configure local transcription with:
+
+```bash
+WHISPER_MODEL=base.en
+WHISPER_MODEL_DIR=data/models/whisper
+WHISPER_LANGUAGE=en
+WHISPER_MIN_CHUNK_SECONDS=4
+WHISPER_MAX_CHUNK_SECONDS=12
+WHISPER_SILENCE_SECONDS=0.9
+```
+
+The suggestion cards still use the configured small chat model
+(`LLM_MODEL_SMALL`, default `gpt-5.4-mini`).
+
+For reliable Webex capture on macOS, route Webex speaker output into a virtual
+audio input such as BlackHole or Loopback, then select:
+
+- `Mic`: your microphone
+- `Meeting audio`: the virtual Webex/BlackHole/Loopback input
+
+If you already have one mixed input device containing both mic and meeting audio,
+select it as `Mic` and leave `Meeting audio` as `None`.
 
 Each project keeps its own uploaded, processed, and reviewed resumes. A resume is
 only in one table at a time:

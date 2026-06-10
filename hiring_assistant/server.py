@@ -21,6 +21,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
+from hiring_assistant.interview_workflows import (
+    InterviewContext,
+    InterviewLLMService,
+    create_realtime_transcription_answer,
+)
 from hiring_assistant.llm_workflows import ResumeLLMService, render_review_markdown
 from hiring_assistant.package_splitter import (
     analyze_resume_package,
@@ -77,6 +82,9 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         try:
             if not segments:
                 self._send_html(self._render_index(query))
+                return
+            if len(segments) == 1 and segments[0] == "interview":
+                self._send_html(self._render_interview(query))
                 return
             if len(segments) == 2 and segments[0] == "projects":
                 self._send_html(self._render_project(segments[1], query))
@@ -159,6 +167,17 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
             if len(segments) == 1 and segments[0] == "projects":
                 self._create_project()
                 return
+            if len(segments) == 2 and segments[0] == "interview":
+                action = segments[1]
+                if action == "prepare":
+                    self._prepare_interview()
+                    return
+                if action == "suggest":
+                    self._suggest_interview()
+                    return
+                if action == "realtime-connect":
+                    self._connect_realtime_transcription()
+                    return
             if len(segments) == 3 and segments[0] == "projects":
                 project_id = segments[1]
                 action = segments[2]
@@ -270,6 +289,90 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         </div>
         """
         return _page("Hiring Assistant", body)
+
+    def _render_interview(self, query: dict[str, list[str]]) -> str:
+        actions = """
+        <a class="banner-link" href="/">Projects</a>
+        """
+        body = f"""
+        <div class="app-shell interview-shell">
+          {_banner("Interview Assistant", "", "", actions=actions)}
+          {_flash(query)}
+          <section class="interview-app" data-interview-app>
+            <aside class="interview-setup">
+              <div class="setup-header">
+                <h2>Session Inputs</h2>
+                <span class="status-pill" data-setup-state>Draft</span>
+              </div>
+              <form id="interview-setup-form" enctype="multipart/form-data">
+                <label>
+                  Job posting
+                  <textarea name="job_posting" rows="7"
+                    placeholder="Paste the posting or attach a PDF/text file."></textarea>
+                  <input name="job_file" type="file" accept=".pdf,.txt,.md,.markdown">
+                </label>
+                <label>
+                  Additional context
+                  <textarea name="work_context" rows="5"
+                    placeholder="Team context, must-cover topics, role notes."></textarea>
+                  <input name="context_file" type="file"
+                    accept=".pdf,.txt,.md,.markdown">
+                </label>
+                <label>
+                  Candidate resume
+                  <textarea name="resume_text" rows="7"
+                    placeholder="Paste resume text or attach a PDF/text file."></textarea>
+                  <input name="resume_file" type="file"
+                    accept=".pdf,.txt,.md,.markdown">
+                </label>
+                <button type="submit">Generate board</button>
+              </form>
+            </aside>
+
+            <section class="interview-board" aria-live="polite">
+              <div class="interview-toolbar">
+                <div class="interview-status">
+                  <span class="record-dot" data-record-dot></span>
+                  <strong data-live-state>Not listening</strong>
+                  <small data-live-detail>Generate the board before starting audio.</small>
+                </div>
+                <div class="interview-controls">
+                  <label class="check-control">
+                    <input type="checkbox" data-capture-screen-audio checked>
+                    <span>Shared audio</span>
+                  </label>
+                  <button type="button" id="interview-start" disabled>Start</button>
+                  <button type="button" id="interview-stop"
+                    class="secondary-button" disabled>Stop</button>
+                  <button type="button" id="interview-refresh"
+                    class="secondary-button" disabled>Refresh</button>
+                </div>
+              </div>
+              <div class="idea-strip" data-signal-strip></div>
+              <div class="idea-grid" data-idea-grid>
+                {_empty_interview_cards()}
+              </div>
+            </section>
+
+            <aside class="transcript-panel">
+              <div class="setup-header">
+                <h2>Transcript</h2>
+                <button type="button" class="secondary-button compact-button"
+                  data-copy-transcript disabled>Copy</button>
+              </div>
+              <div class="transcript-box" data-transcript-box>
+                <p class="muted">Transcript will appear here after audio starts.</p>
+              </div>
+              <label class="manual-note">
+                Manual transcript notes
+                <textarea rows="5" data-manual-transcript
+                  placeholder="Paste or type anything the audio capture misses."></textarea>
+              </label>
+            </aside>
+          </section>
+        </div>
+        """
+        return _page("Interview Assistant", body)
 
     def _render_project(self, project_id: str, query: dict[str, list[str]]) -> str:
         project = self.server.store.load_project(project_id)
@@ -1484,14 +1587,118 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         )
         _rerank_reviewed_recommendations(self.server.store, project_id)
 
+    def _prepare_interview(self) -> None:
+        try:
+            form, files = self._parse_post()
+            context = _interview_context_from_form(form, files)
+            if not context.job_posting.strip() or not context.resume_text.strip():
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "Job posting and candidate resume are required.",
+                    },
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            service = InterviewLLMService(
+                config=self.server.config,
+                ssl_setup=self.server.ssl_setup,
+            )
+            payload = service.prepare_interview(context)
+            self._send_json(
+                {
+                    "ok": True,
+                    "context": {
+                        "job_posting": context.job_posting,
+                        "work_context": context.work_context,
+                        "resume_text": context.resume_text,
+                    },
+                    "payload": payload,
+                }
+            )
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except Exception as exc:  # pragma: no cover - defensive API boundary
+            logger.exception("Interview preparation failed")
+            self._send_json(
+                {"ok": False, "error": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+
+    def _suggest_interview(self) -> None:
+        try:
+            payload = self._parse_json_body()
+            context_payload = payload.get("context") or {}
+            context = InterviewContext(
+                job_posting=str(context_payload.get("job_posting") or ""),
+                work_context=str(context_payload.get("work_context") or ""),
+                resume_text=str(context_payload.get("resume_text") or ""),
+            )
+            transcript = str(payload.get("transcript") or "")
+            previous = payload.get("previous_suggestions")
+            previous_suggestions = previous if isinstance(previous, list) else []
+            if not transcript.strip():
+                self._send_json(
+                    {"ok": False, "error": "Transcript is empty."},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            service = InterviewLLMService(
+                config=self.server.config,
+                ssl_setup=self.server.ssl_setup,
+            )
+            suggestions = service.suggest_live(
+                context=context,
+                transcript=transcript,
+                previous_suggestions=[str(item) for item in previous_suggestions],
+            )
+            self._send_json({"ok": True, "payload": suggestions})
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except Exception as exc:  # pragma: no cover - defensive API boundary
+            logger.exception("Live interview suggestions failed")
+            self._send_json(
+                {"ok": False, "error": str(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+
+    def _connect_realtime_transcription(self) -> None:
+        try:
+            offer_sdp = self._read_body().decode("utf-8")
+            answer_sdp = create_realtime_transcription_answer(
+                offer_sdp=offer_sdp,
+                config=self.server.config,
+                ssl_setup=self.server.ssl_setup,
+            )
+            self._send_plain(answer_sdp, content_type="application/sdp")
+        except Exception as exc:  # pragma: no cover - network/API boundary
+            logger.exception("Realtime transcription setup failed")
+            self._send_plain(
+                str(exc),
+                status=HTTPStatus.BAD_GATEWAY,
+                content_type="text/plain; charset=utf-8",
+            )
+
     def _parse_post(self) -> tuple[dict[str, list[str]], list[UploadedFile]]:
         content_type = self.headers.get("Content-Type", "")
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length)
+        body = self._read_body()
         if content_type.startswith("multipart/form-data"):
             return _parse_multipart(content_type, body)
         fields = parse_qs(body.decode("utf-8"), keep_blank_values=True)
         return fields, []
+
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length", "0"))
+        return self.rfile.read(length)
+
+    def _parse_json_body(self) -> dict[str, Any]:
+        body = self._read_body()
+        if not body:
+            return {}
+        payload = json.loads(body.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a JSON object")
+        return payload
 
     def _redirect_project(
         self,
@@ -1511,6 +1718,31 @@ class HiringAssistantHandler(BaseHTTPRequestHandler):
         encoded = payload.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_json(
+        self,
+        payload: dict[str, Any],
+        status: HTTPStatus = HTTPStatus.OK,
+    ) -> None:
+        encoded = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _send_plain(
+        self,
+        payload: str,
+        status: HTTPStatus = HTTPStatus.OK,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
+        encoded = payload.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
@@ -1625,11 +1857,105 @@ def _parse_multipart(
         payload = part.get_payload(decode=True) or b""
         if filename:
             if payload:
-                files.append(UploadedFile(filename=filename, content=payload))
+                files.append(
+                    UploadedFile(
+                        filename=filename,
+                        content=payload,
+                        field_name=name,
+                    )
+                )
             continue
         value = payload.decode(part.get_content_charset() or "utf-8")
         fields.setdefault(name, []).append(value)
     return fields, files
+
+
+def _interview_context_from_form(
+    form: dict[str, list[str]],
+    files: list[UploadedFile],
+) -> InterviewContext:
+    job_posting = _join_text_parts(
+        [
+            _first(form, "job_posting"),
+            _uploaded_text_for_field(files, "job_file"),
+        ]
+    )
+    work_context = _join_text_parts(
+        [
+            _first(form, "work_context"),
+            _uploaded_text_for_field(files, "context_file"),
+        ]
+    )
+    resume_text = _join_text_parts(
+        [
+            _first(form, "resume_text"),
+            _uploaded_text_for_field(files, "resume_file"),
+        ]
+    )
+    return InterviewContext(
+        job_posting=_clamp_text(job_posting, 70000),
+        work_context=_clamp_text(work_context, 40000),
+        resume_text=_clamp_text(resume_text, 70000),
+    )
+
+
+def _uploaded_text_for_field(files: list[UploadedFile], field_name: str) -> str:
+    parts = [
+        _uploaded_file_to_text(uploaded_file)
+        for uploaded_file in files
+        if uploaded_file.field_name == field_name
+    ]
+    return _join_text_parts(parts)
+
+
+def _uploaded_file_to_text(uploaded_file: UploadedFile) -> str:
+    suffix = Path(uploaded_file.filename).suffix.lower()
+    if suffix == ".pdf":
+        return _pdf_upload_to_text(uploaded_file)
+    if suffix in {".txt", ".md", ".markdown", ""}:
+        return _decode_text_upload(uploaded_file)
+    raise ValueError(
+        f"{uploaded_file.filename} is not a supported interview upload type"
+    )
+
+
+def _pdf_upload_to_text(uploaded_file: UploadedFile) -> str:
+    try:
+        import fitz  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - dependency is in requirements
+        raise ValueError("PyMuPDF is required to extract PDF text") from exc
+
+    try:
+        document = fitz.open(stream=uploaded_file.content, filetype="pdf")
+    except Exception as exc:  # pragma: no cover - library-specific parsing errors
+        raise ValueError(f"Could not read PDF: {uploaded_file.filename}") from exc
+    try:
+        pages = [page.get_text("text").strip() for page in document]
+    finally:
+        document.close()
+    text = _join_text_parts(pages)
+    if not text.strip():
+        raise ValueError(f"No selectable text found in {uploaded_file.filename}")
+    return text
+
+
+def _decode_text_upload(uploaded_file: UploadedFile) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "cp1252"):
+        try:
+            return uploaded_file.content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not decode text file: {uploaded_file.filename}")
+
+
+def _join_text_parts(parts: list[str]) -> str:
+    return "\n\n".join(part.strip() for part in parts if part and part.strip())
+
+
+def _clamp_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 22].rstrip() + "\n[truncated locally]"
 
 
 def _banner(
@@ -1666,6 +1992,21 @@ def _reset_form() -> str:
     """
 
 
+def _empty_interview_cards() -> str:
+    cards = [
+        ("Opening", "Generate the board to load first questions."),
+        ("Topic", "Live suggestions will pin here during the interview."),
+        ("Transition", "Refresh will add new ways to move the conversation."),
+    ]
+    return "".join(
+        "<article class=\"idea-card muted-card\">"
+        f"<span>{_h(title)}</span>"
+        f"<strong>{_h(text)}</strong>"
+        "</article>"
+        for title, text in cards
+    )
+
+
 def _project_sidebar(
     projects: list[dict[str, Any]],
     active_project_id: str,
@@ -1685,21 +2026,31 @@ def _project_sidebar(
         )
     if not items:
         items.append("<p class=\"muted sidebar-empty\">No projects yet.</p>")
-    tools = ""
+    tool_links = [
+        '<a class="side-tool" href="/interview">Interview assistant</a>'
+    ]
     if active_project_id:
-        tools = f"""
-        <div class="sidebar-tools">
+        tool_links.extend(
+            [
+                f"""
           <a class="side-tool" href="/projects/{quote(active_project_id)}">
             Resume tables
-          </a>
+          </a>""",
+                f"""
           <a class="side-tool" href="/projects/{quote(active_project_id)}/packages">
             Package splitter
-          </a>
+          </a>""",
+                f"""
           <a class="side-tool" href="{_reviewed_export_href(active_project_id)}">
             Reviewed export
-          </a>
-        </div>
-        """
+          </a>""",
+            ]
+        )
+    tools = f"""
+      <div class="sidebar-tools">
+        {''.join(tool_links)}
+      </div>
+    """
     return f"""
     <aside class="left-pane">
       <div class="sidebar-section">
@@ -3043,6 +3394,8 @@ def _interaction_script() -> str:
     return """
     <script>
       (() => {
+        initInterviewApp();
+
         document.addEventListener("click", event => {
           const detailsButton = event.target.closest("[data-details-target]");
           if (detailsButton) {
@@ -3085,6 +3438,370 @@ def _interaction_script() -> str:
             submit.textContent = "Working...";
           }
         });
+
+        function initInterviewApp() {
+          const app = document.querySelector("[data-interview-app]");
+          if (!app) return;
+
+          const form = document.getElementById("interview-setup-form");
+          const setupState = app.querySelector("[data-setup-state]");
+          const liveState = app.querySelector("[data-live-state]");
+          const liveDetail = app.querySelector("[data-live-detail]");
+          const recordDot = app.querySelector("[data-record-dot]");
+          const ideaGrid = app.querySelector("[data-idea-grid]");
+          const signalStrip = app.querySelector("[data-signal-strip]");
+          const transcriptBox = app.querySelector("[data-transcript-box]");
+          const manualTranscript = app.querySelector("[data-manual-transcript]");
+          const captureScreenAudio = app.querySelector("[data-capture-screen-audio]");
+          const startButton = document.getElementById("interview-start");
+          const stopButton = document.getElementById("interview-stop");
+          const refreshButton = document.getElementById("interview-refresh");
+          const copyButton = app.querySelector("[data-copy-transcript]");
+
+          let context = null;
+          let cards = [];
+          let peer = null;
+          let dataChannel = null;
+          let audioContext = null;
+          let audioSources = [];
+          let mediaStreams = [];
+          let transcriptTurns = new Map();
+          let turnOrder = [];
+          let suggestionInFlight = false;
+          let lastSuggestionWordCount = 0;
+          let periodicRefresh = null;
+
+          form.addEventListener("submit", async event => {
+            event.preventDefault();
+            setSetupState("Working...");
+            setLiveStatus("Preparing board", "Generating interview prompts.", false);
+            const submit = form.querySelector("button[type='submit']");
+            submit.disabled = true;
+            try {
+              const response = await fetch("/interview/prepare", {
+                method: "POST",
+                body: new FormData(form),
+              });
+              const data = await response.json();
+              if (!response.ok || !data.ok) {
+                throw new Error(data.error || "Interview preparation failed.");
+              }
+              context = data.context;
+              renderPayload(data.payload, false);
+              setSetupState("Loaded");
+              setLiveStatus("Ready", "Start audio when the meeting begins.", false);
+              startButton.disabled = false;
+              refreshButton.disabled = false;
+            } catch (error) {
+              setSetupState("Error");
+              setLiveStatus("Setup error", error.message, false);
+            } finally {
+              submit.disabled = false;
+            }
+          });
+
+          startButton.addEventListener("click", startAudio);
+          stopButton.addEventListener("click", stopAudio);
+          refreshButton.addEventListener("click", () => requestSuggestions("manual"));
+          manualTranscript.addEventListener("input", () => maybeRequestSuggestions("manual"));
+          copyButton.addEventListener("click", async () => {
+            await navigator.clipboard.writeText(getTranscriptText());
+          });
+
+          async function startAudio() {
+            if (!context || peer) return;
+            startButton.disabled = true;
+            setLiveStatus("Starting", "Requesting audio permissions.", false);
+            try {
+              const streams = [];
+              const micStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                  echoCancellation: true,
+                  noiseSuppression: true,
+                  autoGainControl: true,
+                },
+              });
+              streams.push(micStream);
+
+              if (captureScreenAudio.checked && navigator.mediaDevices.getDisplayMedia) {
+                try {
+                  const sharedStream = await navigator.mediaDevices.getDisplayMedia({
+                    video: true,
+                    audio: true,
+                  });
+                  streams.push(sharedStream);
+                } catch (error) {
+                  setLiveStatus(
+                    "Mic only",
+                    "Shared audio was skipped; microphone capture is active.",
+                    false
+                  );
+                }
+              }
+
+              mediaStreams = streams;
+              const audioStream = await mixedAudioStream(streams);
+              peer = new RTCPeerConnection();
+              audioStream.getAudioTracks().forEach(track => {
+                peer.addTrack(track, audioStream);
+              });
+              dataChannel = peer.createDataChannel("oai-events");
+              dataChannel.addEventListener("message", event => {
+                handleRealtimeEvent(JSON.parse(event.data));
+              });
+              peer.addEventListener("connectionstatechange", () => {
+                if (!peer) return;
+                if (peer.connectionState === "connected") {
+                  setLiveStatus("Listening", "Transcript capture is active.", true);
+                }
+                if (["failed", "closed", "disconnected"].includes(peer.connectionState)) {
+                  setLiveStatus("Stopped", "Audio connection ended.", false);
+                }
+              });
+
+              const offer = await peer.createOffer();
+              await peer.setLocalDescription(offer);
+              const response = await fetch("/interview/realtime-connect", {
+                method: "POST",
+                headers: {"Content-Type": "application/sdp"},
+                body: offer.sdp,
+              });
+              if (!response.ok) {
+                throw new Error(await response.text());
+              }
+              await peer.setRemoteDescription({
+                type: "answer",
+                sdp: await response.text(),
+              });
+              stopButton.disabled = false;
+              copyButton.disabled = false;
+              periodicRefresh = window.setInterval(() => {
+                maybeRequestSuggestions("timer");
+              }, 30000);
+            } catch (error) {
+              stopAudio();
+              setLiveStatus("Audio error", error.message, false);
+              startButton.disabled = false;
+            }
+          }
+
+          function stopAudio() {
+            if (periodicRefresh) {
+              window.clearInterval(periodicRefresh);
+              periodicRefresh = null;
+            }
+            if (dataChannel) {
+              dataChannel.close();
+              dataChannel = null;
+            }
+            if (peer) {
+              peer.close();
+              peer = null;
+            }
+            audioSources = [];
+            if (audioContext) {
+              audioContext.close();
+              audioContext = null;
+            }
+            mediaStreams.forEach(stream => {
+              stream.getTracks().forEach(track => track.stop());
+            });
+            mediaStreams = [];
+            startButton.disabled = !context;
+            stopButton.disabled = true;
+            setLiveStatus("Stopped", "Audio capture is off.", false);
+          }
+
+          async function mixedAudioStream(streams) {
+            const audioTracks = streams.flatMap(stream => stream.getAudioTracks());
+            if (!audioTracks.length) {
+              throw new Error("No audio track was available.");
+            }
+            if (audioTracks.length === 1) {
+              return new MediaStream([audioTracks[0]]);
+            }
+            audioContext = new AudioContext();
+            const destination = audioContext.createMediaStreamDestination();
+            audioTracks.forEach(track => {
+              const source = audioContext.createMediaStreamSource(
+                new MediaStream([track])
+              );
+              source.connect(destination);
+              audioSources.push(source);
+            });
+            return destination.stream;
+          }
+
+          function handleRealtimeEvent(event) {
+            if (!event || !event.type) return;
+            if (event.type === "conversation.item.input_audio_transcription.delta") {
+              const id = event.item_id || "partial";
+              const previous = transcriptTurns.get(id) || {text: "", final: false};
+              upsertTranscriptTurn(id, previous.text + (event.delta || ""), false);
+              return;
+            }
+            if (event.type === "conversation.item.input_audio_transcription.completed") {
+              const id = event.item_id || `turn-${turnOrder.length + 1}`;
+              const transcript = event.transcript || "";
+              upsertTranscriptTurn(id, transcript, true);
+              maybeRequestSuggestions(hasBreakWords(transcript) ? "break" : "pause");
+              return;
+            }
+            if (event.type === "input_audio_buffer.speech_stopped") {
+              maybeRequestSuggestions("pause");
+              return;
+            }
+            if (event.type === "error") {
+              const message = event.error && event.error.message
+                ? event.error.message
+                : "Realtime transcription error.";
+              setLiveStatus("Audio error", message, false);
+            }
+          }
+
+          function upsertTranscriptTurn(id, text, final) {
+            if (!turnOrder.includes(id)) {
+              turnOrder.push(id);
+            }
+            transcriptTurns.set(id, {text, final});
+            renderTranscript();
+          }
+
+          function renderTranscript() {
+            transcriptBox.innerHTML = "";
+            if (!turnOrder.length) {
+              const empty = document.createElement("p");
+              empty.className = "muted";
+              empty.textContent = "Listening for transcript...";
+              transcriptBox.appendChild(empty);
+              return;
+            }
+            turnOrder.forEach(id => {
+              const turn = transcriptTurns.get(id);
+              if (!turn || !turn.text.trim()) return;
+              const p = document.createElement("p");
+              p.className = turn.final ? "transcript-turn" : "transcript-turn partial";
+              p.textContent = turn.text;
+              transcriptBox.appendChild(p);
+            });
+            transcriptBox.scrollTop = transcriptBox.scrollHeight;
+          }
+
+          async function requestSuggestions(reason) {
+            if (!context || suggestionInFlight) return;
+            const transcript = getTranscriptText();
+            if (countWords(transcript) < 8) {
+              setLiveStatus("Listening", "Waiting for more transcript.", Boolean(peer));
+              return;
+            }
+            suggestionInFlight = true;
+            refreshButton.disabled = true;
+            setLiveStatus("Refreshing", `Updating suggestions from ${reason}.`, Boolean(peer));
+            try {
+              const response = await fetch("/interview/suggest", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({
+                  context,
+                  transcript,
+                  previous_suggestions: cards.map(card => card.text),
+                }),
+              });
+              const data = await response.json();
+              if (!response.ok || !data.ok) {
+                throw new Error(data.error || "Suggestion refresh failed.");
+              }
+              renderPayload(data.payload, true);
+              lastSuggestionWordCount = countWords(transcript);
+              setLiveStatus("Listening", "Suggestions refreshed.", Boolean(peer));
+            } catch (error) {
+              setLiveStatus("Refresh error", error.message, Boolean(peer));
+            } finally {
+              suggestionInFlight = false;
+              refreshButton.disabled = false;
+            }
+          }
+
+          function maybeRequestSuggestions(reason) {
+            const words = countWords(getTranscriptText());
+            const enoughWords = words - lastSuggestionWordCount >= 70;
+            const pauseTrigger = reason === "pause" && words > lastSuggestionWordCount;
+            const breakTrigger = reason === "break";
+            if (enoughWords || pauseTrigger || breakTrigger) {
+              window.setTimeout(() => requestSuggestions(reason), 900);
+            }
+          }
+
+          function renderPayload(payload, isLive) {
+            cards = Array.isArray(payload.cards) ? payload.cards : [];
+            ideaGrid.innerHTML = "";
+            if (!cards.length) {
+              ideaGrid.innerHTML = `
+                <article class="idea-card muted-card">
+                  <span>Suggestions</span>
+                  <strong>No suggestions returned.</strong>
+                </article>
+              `;
+              return;
+            }
+            cards.forEach(card => {
+              const article = document.createElement("article");
+              const kind = String(card.kind || "suggestion");
+              article.className = `idea-card ${kind}${isLive ? " live" : ""}`;
+              const label = document.createElement("span");
+              label.textContent = card.title || kind;
+              const text = document.createElement("strong");
+              text.textContent = card.text || "";
+              article.append(label, text);
+              if (card.detail) {
+                const detail = document.createElement("p");
+                detail.textContent = card.detail;
+                article.appendChild(detail);
+              }
+              ideaGrid.appendChild(article);
+            });
+            renderSignals(payload.signals || []);
+          }
+
+          function renderSignals(signals) {
+            signalStrip.innerHTML = "";
+            signals.forEach(signal => {
+              const pill = document.createElement("span");
+              pill.className = "signal-pill";
+              pill.textContent = signal;
+              signalStrip.appendChild(pill);
+            });
+          }
+
+          function getTranscriptText() {
+            const turns = turnOrder
+              .map(id => transcriptTurns.get(id))
+              .filter(Boolean)
+              .map(turn => turn.text.trim())
+              .filter(Boolean);
+            const manual = manualTranscript.value.trim();
+            if (manual) turns.push(manual);
+            return turns.join("\\n\\n");
+          }
+
+          function countWords(text) {
+            return (text.trim().match(/\\S+/g) || []).length;
+          }
+
+          function hasBreakWords(text) {
+            return /\\b(anyway|so moving|moving on|next topic|another area|let's switch|let us switch)\\b/i.test(text);
+          }
+
+          function setSetupState(text) {
+            setupState.textContent = text;
+          }
+
+          function setLiveStatus(state, detail, active) {
+            liveState.textContent = state;
+            liveDetail.textContent = detail;
+            recordDot.classList.toggle("active", active);
+          }
+        }
       })();
     </script>
     """
@@ -4399,6 +5116,202 @@ def _page(title: str, body: str) -> str:
       margin-top: 0;
       background: var(--surface-soft);
     }}
+    .interview-shell {{
+      width: min(100%, 1760px);
+    }}
+    .interview-app {{
+      display: grid;
+      grid-template-columns: minmax(280px, 340px) minmax(0, 1fr) minmax(320px, 420px);
+      gap: 16px;
+      align-items: start;
+    }}
+    .interview-setup,
+    .interview-board,
+    .transcript-panel {{
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }}
+    .interview-setup,
+    .transcript-panel {{
+      position: sticky;
+      top: 16px;
+      max-height: calc(100vh - 32px);
+      overflow: auto;
+      padding: 16px;
+    }}
+    .setup-header {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }}
+    .setup-header h2 {{
+      margin: 0;
+    }}
+    .interview-setup form {{
+      display: grid;
+      gap: 10px;
+    }}
+    .interview-setup textarea {{
+      min-height: 96px;
+    }}
+    .interview-board {{
+      display: grid;
+      gap: 14px;
+      padding: 14px;
+    }}
+    .interview-toolbar {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .interview-status {{
+      display: grid;
+      grid-template-columns: 14px minmax(0, 1fr);
+      gap: 2px 9px;
+      align-items: center;
+      min-width: 220px;
+    }}
+    .interview-status small {{
+      grid-column: 2;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .record-dot {{
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: #98a2b3;
+    }}
+    .record-dot.active {{
+      background: #d92d20;
+      box-shadow: 0 0 0 4px rgb(217 45 32 / 14%);
+    }}
+    .interview-controls {{
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    .check-control {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 38px;
+      margin: 0;
+      padding: 8px 10px;
+      color: var(--text);
+      background: var(--surface-soft);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    .check-control input {{
+      margin: 0;
+    }}
+    .idea-strip {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      min-height: 0;
+    }}
+    .signal-pill {{
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+      padding: 6px 9px;
+      color: #344054;
+      background: #eef2f6;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      overflow-wrap: anywhere;
+    }}
+    .idea-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      align-items: stretch;
+    }}
+    .idea-card {{
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 9px;
+      min-height: 178px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      overflow-wrap: anywhere;
+    }}
+    .idea-card.live {{
+      border-color: #7dd3c7;
+      background: #f0fdfa;
+    }}
+    .idea-card.transition {{
+      border-color: #b7c3cf;
+      background: #f8fafb;
+    }}
+    .idea-card.watchout {{
+      border-color: #f6c27a;
+      background: #fff8eb;
+    }}
+    .idea-card span {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 900;
+      text-transform: uppercase;
+    }}
+    .idea-card strong {{
+      color: var(--text);
+      font-size: 25px;
+      line-height: 1.16;
+      font-weight: 850;
+    }}
+    .idea-card p {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }}
+    .muted-card strong {{
+      color: var(--muted);
+      font-size: 20px;
+    }}
+    .transcript-panel {{
+      display: grid;
+      gap: 12px;
+    }}
+    .transcript-box {{
+      min-height: 360px;
+      max-height: 54vh;
+      overflow: auto;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-soft);
+      line-height: 1.45;
+      font-size: 14px;
+      white-space: pre-wrap;
+    }}
+    .transcript-turn {{
+      margin: 0 0 10px;
+    }}
+    .transcript-turn.partial {{
+      color: var(--muted);
+    }}
+    .manual-note {{
+      margin-bottom: 0;
+    }}
     .flash {{
       border: 1px solid var(--line);
       border-left: 4px solid var(--accent);
@@ -4428,6 +5341,34 @@ def _page(title: str, body: str) -> str:
       .right-pane {{
         position: static;
         max-height: none;
+      }}
+      .interview-app {{
+        grid-template-columns: 1fr;
+      }}
+      .interview-setup,
+      .transcript-panel {{
+        position: static;
+        max-height: none;
+      }}
+      .interview-toolbar {{
+        display: grid;
+      }}
+      .interview-controls {{
+        justify-content: stretch;
+      }}
+      .interview-controls button,
+      .interview-controls .check-control {{
+        flex: 1 1 130px;
+        justify-content: center;
+      }}
+      .idea-grid {{
+        grid-template-columns: 1fr;
+      }}
+      .idea-card {{
+        min-height: 140px;
+      }}
+      .idea-card strong {{
+        font-size: 20px;
       }}
       .package-upload-form {{
         grid-template-columns: 1fr;

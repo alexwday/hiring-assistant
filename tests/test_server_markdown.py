@@ -7,6 +7,7 @@ from hiring_assistant.server import (
     HiringAssistantHandler,
     _backfill_candidate_name_hints,
     _document_label,
+    _interview_context_from_form,
     _markdown_to_html,
     _privacy_filename,
 )
@@ -126,3 +127,23 @@ def test_backfill_candidate_name_hint_from_package_rows(tmp_path):
 
     assert updated["candidate_name_hint"] == "Jordan Lee"
     assert _document_label(updated) == "Jordan Lee | Candidate C001"
+
+
+def test_interview_context_uses_upload_field_names():
+    """It keeps job, context, and resume uploads separated by form field."""
+    context = _interview_context_from_form(
+        {
+            "job_posting": ["Posting text"],
+            "work_context": ["Context text"],
+            "resume_text": ["Resume text"],
+        },
+        [
+            UploadedFile("job.md", b"Job file", field_name="job_file"),
+            UploadedFile("context.txt", b"Context file", field_name="context_file"),
+            UploadedFile("resume.md", b"Resume file", field_name="resume_file"),
+        ],
+    )
+
+    assert context.job_posting == "Posting text\n\nJob file"
+    assert context.work_context == "Context text\n\nContext file"
+    assert context.resume_text == "Resume text\n\nResume file"
