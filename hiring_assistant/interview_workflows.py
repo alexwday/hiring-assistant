@@ -51,7 +51,6 @@ class InterviewLLMService:
                 messages=_prepare_messages(context),
                 settings={
                     "model_size": "small",
-                    "max_tokens": 5000,
                     "response_format": {"type": "json_object"},
                 },
             )
@@ -77,7 +76,6 @@ class InterviewLLMService:
                 messages=_live_messages(context, transcript, previous_suggestions or []),
                 settings={
                     "model_size": "small",
-                    "max_tokens": 3500,
                     "response_format": {"type": "json_object"},
                 },
             )

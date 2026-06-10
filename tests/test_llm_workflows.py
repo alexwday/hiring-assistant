@@ -1,8 +1,11 @@
 """Tests for resume LLM workflow helpers."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from hiring_assistant.llm_workflows import (
+    ResumeLLMService,
     _normalize_review_payload,
     _remove_pii_metadata,
     parse_json_response,
@@ -143,3 +146,45 @@ def test_parse_json_response_reports_empty_llm_content():
     assert "final rerank returned an empty LLM response" in message
     assert "finish_reason=length" in message
     assert "completion_tokens=5000" in message
+
+
+def test_review_payload_uses_profile_token_limit(monkeypatch):
+    """It does not override LLM_MAX_TOKENS_SMALL with a smaller review cap."""
+    captured = {}
+
+    def fake_guarded_call(client, messages, settings, **kwargs):
+        captured["settings"] = settings
+        return {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": '{"education_score": 6, "experience_score": 6, '
+                        '"projects_score": 6, "holistic_score": 6}',
+                    },
+                }
+            ]
+        }
+
+    monkeypatch.setattr(
+        "hiring_assistant.llm_workflows._guarded_llm_call",
+        fake_guarded_call,
+    )
+    service = ResumeLLMService(
+        config=SimpleNamespace(),
+        ssl_setup=SimpleNamespace(),
+    )
+
+    service._review_payload(
+        client=SimpleNamespace(),
+        resume_markdown="## Resume",
+        metadata={},
+        job_posting="Posting",
+        work_context="Context",
+    )
+
+    assert captured["settings"] == {
+        "model_size": "small",
+        "response_format": {"type": "json_object"},
+    }

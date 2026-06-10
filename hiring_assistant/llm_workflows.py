@@ -274,7 +274,6 @@ class ResumeLLMService:
             messages=messages,
             settings={
                 "model_size": "small",
-                "max_tokens": 8192,
                 "temperature": 0,
             },
         )
@@ -319,7 +318,6 @@ class ResumeLLMService:
             messages=messages,
             settings={
                 "model_size": "small",
-                "max_tokens": 1500,
                 "response_format": {"type": "json_object"},
             },
         )
@@ -479,7 +477,6 @@ class ResumeLLMService:
             messages=messages,
             settings={
                 "model_size": "small",
-                "max_tokens": 5000,
                 "response_format": {"type": "json_object"},
             },
         )
