@@ -1,6 +1,9 @@
 """Tests for live interview assistant workflow helpers."""
 
-from hiring_assistant.interview_workflows import normalize_interview_payload
+from hiring_assistant.interview_workflows import (
+    normalize_interview_payload,
+    normalize_next_paths_payload,
+)
 
 
 def test_interview_payload_normalizes_cards_and_named_sections():
@@ -52,3 +55,36 @@ def test_interview_payload_dedupes_repeated_card_text():
         "Tell me about your current role.",
         "What changed?",
     ]
+
+
+def test_next_paths_payload_normalizes_exactly_three_cards():
+    """It turns compact live suggestions into exactly three visible paths."""
+    payload = normalize_next_paths_payload(
+        {
+            "summary": "Steer toward implementation detail.",
+            "paths": [
+                {
+                    "title": "Clarify scope",
+                    "prompt": "What part did you personally own?",
+                    "why": "They described team results.",
+                },
+                {
+                    "title": "Go deeper",
+                    "prompt": "What failed during rollout?",
+                    "why": "Tests practical judgment.",
+                },
+            ],
+            "signals": ["Mentioned a migration"],
+        }
+    )
+
+    assert payload["summary"] == "Steer toward implementation detail."
+    assert payload["signals"] == ["Mentioned a migration"]
+    assert len(payload["paths"]) == 3
+    assert payload["paths"][0] == {
+        "kind": "live",
+        "title": "Clarify scope",
+        "text": "What part did you personally own?",
+        "detail": "They described team results.",
+    }
+    assert payload["paths"][2]["title"] == "Transition"

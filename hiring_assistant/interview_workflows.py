@@ -20,10 +20,14 @@ logger = logging.getLogger(__name__)
 
 INTERVIEW_PREP_PROMPT_VERSION = "interview-prep-v1"
 INTERVIEW_LIVE_PROMPT_VERSION = "interview-live-suggestions-v1"
+INTERVIEW_NEXT_PATHS_PROMPT_VERSION = "interview-next-paths-v1"
 DEFAULT_REALTIME_MODEL = "gpt-realtime"
 DEFAULT_REALTIME_TRANSCRIPTION_MODEL = "gpt-realtime-whisper"
 MAX_CONTEXT_CHARS = 18000
 MAX_TRANSCRIPT_CHARS = 14000
+MAX_LIVE_BRIEF_CHARS = 9000
+MAX_LIVE_TRANSCRIPT_CHARS = 5000
+DEFAULT_LIVE_SUGGESTION_MAX_TOKENS = 900
 
 
 @dataclass(frozen=True)
@@ -86,6 +90,43 @@ class InterviewLLMService:
         normalized = normalize_interview_payload(payload)
         normalized["prompt_versions"] = {
             "interview_live": INTERVIEW_LIVE_PROMPT_VERSION
+        }
+        return normalized
+
+    def suggest_next_paths(
+        self,
+        context: InterviewContext,
+        transcript_tail: str,
+        current_paths: list[dict[str, str]] | None = None,
+        manual_notes: str = "",
+    ) -> dict[str, Any]:
+        """Create exactly three compact next-path suggestions for the live view."""
+        client = LLMClient(config=self.config, ssl_setup=self.ssl_setup)
+        try:
+            response = _guarded_llm_call(
+                client,
+                messages=_next_path_messages(
+                    context=context,
+                    transcript_tail=transcript_tail,
+                    current_paths=current_paths or [],
+                    manual_notes=manual_notes,
+                ),
+                settings={
+                    "model_size": "small",
+                    "max_tokens": _env_int(
+                        "LLM_LIVE_SUGGESTION_MAX_TOKENS",
+                        DEFAULT_LIVE_SUGGESTION_MAX_TOKENS,
+                    ),
+                    "response_format": {"type": "json_object"},
+                },
+            )
+        finally:
+            client.close()
+
+        payload = parse_json_response(response, "live next paths")
+        normalized = normalize_next_paths_payload(payload)
+        normalized["prompt_versions"] = {
+            "interview_next_paths": INTERVIEW_NEXT_PATHS_PROMPT_VERSION
         }
         return normalized
 
@@ -171,6 +212,51 @@ def normalize_interview_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_next_paths_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize model JSON into exactly three live path cards."""
+    raw_paths = (
+        payload.get("paths")
+        or payload.get("next_paths")
+        or payload.get("top_suggestions")
+        or payload.get("suggestions")
+        or payload.get("cards")
+    )
+    paths = _normalize_cards(raw_paths, "live", "Next path")
+    if not paths:
+        paths = _normalize_cards(payload, "live", "Next path")
+
+    deduped = _dedupe_cards(paths)
+    fallback_paths = [
+        {
+            "kind": "live",
+            "title": "Clarify",
+            "text": "Ask for the concrete example behind the point they just made.",
+            "detail": "Good when the transcript has a claim but not the evidence yet.",
+        },
+        {
+            "kind": "live",
+            "title": "Connect",
+            "text": "Tie their answer back to the role and ask how they would apply it here.",
+            "detail": "Keeps the conversation job-relevant without changing topics abruptly.",
+        },
+        {
+            "kind": "live",
+            "title": "Transition",
+            "text": "Move to the next priority topic from the interview board.",
+            "detail": "Use when the current thread feels complete.",
+        },
+    ]
+    while len(deduped) < 3:
+        deduped.append(fallback_paths[len(deduped)])
+    return {
+        "summary": _string(payload.get("summary") or payload.get("steering_note")),
+        "paths": deduped[:3],
+        "signals": _string_list(payload.get("signals") or payload.get("transcript_signals"))[
+            :3
+        ],
+    }
+
+
 def _prepare_messages(context: InterviewContext) -> list[dict[str, str]]:
     return [
         {
@@ -243,6 +329,67 @@ def _live_messages(
             ),
         },
     ]
+
+
+def _next_path_messages(
+    context: InterviewContext,
+    transcript_tail: str,
+    current_paths: list[dict[str, str]],
+    manual_notes: str,
+) -> list[dict[str, str]]:
+    previous = "\n".join(
+        f"- {_trim(path.get('title', ''), 80)}: "
+        f"{_trim(path.get('text') or path.get('prompt') or '', 220)}"
+        for path in current_paths[:3]
+    )
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a live interview copilot. Return fast, concise, "
+                "spoken-language suggestions for what the interviewer could ask "
+                "or say next. Do not score or evaluate the candidate. Return only JSON."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Generate exactly three next conversation paths.\n\n"
+                "Return JSON with this exact shape:\n"
+                "{\n"
+                '  "summary": "one short steering note",\n'
+                '  "paths": [\n'
+                '    {"title": "short label", "prompt": "one thing to ask or say", '
+                '"why": "brief reason"}\n'
+                "  ]\n"
+                "}\n\n"
+                "Rules:\n"
+                "- paths must contain exactly 3 items\n"
+                "- prompt must be ready to say out loud\n"
+                "- prefer what is most useful in the next 30-90 seconds\n"
+                "- avoid repeating a current visible path unless it is still clearly best\n"
+                "- keep each prompt under 28 words\n\n"
+                f"Compact interview brief:\n{_compact_interview_brief(context)}\n\n"
+                f"Current visible paths:\n{previous or '- none'}\n\n"
+                f"Manual notes:\n{_trim(manual_notes, 1200) or '- none'}\n\n"
+                f"Recent transcript:\n{_trim_tail(transcript_tail, MAX_LIVE_TRANSCRIPT_CHARS)}"
+            ),
+        },
+    ]
+
+
+def _compact_interview_brief(context: InterviewContext) -> str:
+    """Return a compact deterministic brief for fast live prompts."""
+    sections = [
+        ("Job posting", context.job_posting, 3200),
+        ("Additional context", context.work_context, 1800),
+        ("Candidate resume", context.resume_text, 3200),
+    ]
+    brief = "\n\n".join(
+        f"{label}:\n{_trim(value, limit) or '- none'}"
+        for label, value, limit in sections
+    )
+    return _trim(brief, MAX_LIVE_BRIEF_CHARS)
 
 
 def _realtime_session_config() -> dict[str, Any]:
@@ -397,3 +544,13 @@ def _trim_tail(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return "[earlier transcript omitted]\n" + text[-limit:].lstrip()
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default

@@ -63,28 +63,34 @@ without a screen/tab sharing picker.
 `python interview_app.py` launches a PySide6 desktop version of the same
 interview assistant. It uses `sounddevice` to capture selected local input
 devices, mixes them into 16 kHz mono audio, and transcribes locally with
-OpenAI's open-source Whisper package. No audio is sent to the OpenAI
-transcription endpoint.
+`faster-whisper`. No audio is sent to the OpenAI transcription endpoint.
 
 On first start, the app downloads the configured local Whisper model into:
 
 ```text
-data/models/whisper/
+data/models/faster-whisper/
 ```
 
-The default model is `base.en`. Configure local transcription with:
+The default model is `small.en` for better accuracy. If the work computer feels
+too slow, set `WHISPER_MODEL=base.en` for lower latency. Configure local
+transcription with:
 
 ```bash
-WHISPER_MODEL=base.en
-WHISPER_MODEL_DIR=data/models/whisper
+WHISPER_MODEL=small.en
+WHISPER_MODEL_DIR=data/models/faster-whisper
+WHISPER_DEVICE=cpu
+WHISPER_COMPUTE_TYPE=int8
 WHISPER_LANGUAGE=en
-WHISPER_MIN_CHUNK_SECONDS=4
-WHISPER_MAX_CHUNK_SECONDS=12
-WHISPER_SILENCE_SECONDS=0.9
+WHISPER_PARTIAL_INTERVAL_SECONDS=1.0
+WHISPER_STABLE_WINDOW_SECONDS=6.0
+WHISPER_MAX_WINDOW_SECONDS=10.0
+WHISPER_VAD_MIN_SILENCE_MS=300
 ```
 
-The suggestion cards still use the configured small chat model
-(`LLM_MODEL_SMALL`, default `gpt-5.4-mini`).
+The generated interview board stays fixed during the interview. Live refreshes
+only update the top `Next 3 paths` cards and use the configured small chat model
+(`LLM_MODEL_SMALL`, default `gpt-5.4-mini`). You can cap live response size with
+`LLM_LIVE_SUGGESTION_MAX_TOKENS` when tuning latency.
 
 For reliable Webex capture on macOS, route Webex speaker output into a virtual
 audio input such as BlackHole or Loopback, then select:
@@ -94,6 +100,16 @@ audio input such as BlackHole or Loopback, then select:
 
 If you already have one mixed input device containing both mic and meeting audio,
 select it as `Mic` and leave `Meeting audio` as `None`.
+
+Before an interview on your work computer:
+
+1. Run `python interview_app.py`.
+2. Load the job posting, context notes, and resume.
+3. Click `Generate board`.
+4. Select your mic and the Webex loopback input.
+5. Click `Start` and speak for 10 seconds.
+6. Confirm the partial transcript updates quickly and the `Next 3 paths` cards
+   refresh without clearing the board.
 
 Each project keeps its own uploaded, processed, and reviewed resumes. A resume is
 only in one table at a time:
